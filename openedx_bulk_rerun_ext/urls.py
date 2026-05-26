@@ -1,10 +1,14 @@
 """
 URLs for openedx_bulk_rerun_ext.
 """
-from django.urls import re_path  # pylint: disable=unused-import
-from django.views.generic import TemplateView  # pylint: disable=unused-import
+from django.urls import path
+
+from .views import CourseRerunJobDetail, CourseRerunJobListCreate, ValidateCourseKeysView
+
+app_name = 'bulk_rerun'
 
 urlpatterns = [
-    # TODO: Fill in URL patterns and views here.
-    # re_path(r'', TemplateView.as_view(template_name="openedx_bulk_rerun_ext/base.html")),
+    path('validate/', ValidateCourseKeysView.as_view(), name='validate'),
+    path('jobs/', CourseRerunJobListCreate.as_view(), name='jobs-list'),
+    path('jobs/<uuid:job_id>/', CourseRerunJobDetail.as_view(), name='jobs-detail'),
 ]
