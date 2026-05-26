@@ -32,21 +32,35 @@ INSTALLED_APPS = (
     'django.contrib.contenttypes',
     'django.contrib.messages',
     'django.contrib.sessions',
+    'rest_framework',
     'openedx_bulk_rerun_ext',
 )
+
+# DRF — BasicAuthentication is included so that unauthenticated requests receive
+# 401 (with a WWW-Authenticate header) rather than 403.
+REST_FRAMEWORK = {
+    'DEFAULT_AUTHENTICATION_CLASSES': [
+        'rest_framework.authentication.BasicAuthentication',
+        'rest_framework.authentication.SessionAuthentication',
+    ],
+}
+
+# Celery — run tasks synchronously so no broker is needed during tests.
+CELERY_TASK_ALWAYS_EAGER = True
+CELERY_TASK_EAGER_PROPAGATES = True
 
 LOCALE_PATHS = [
     root('openedx_bulk_rerun_ext', 'conf', 'locale'),
 ]
 
-ROOT_URLCONF = 'openedx_bulk_rerun_ext.urls'
+ROOT_URLCONF = 'test_urls'
 
 SECRET_KEY = 'insecure-secret-key'
 
 MIDDLEWARE = (
+    'django.contrib.sessions.middleware.SessionMiddleware',
     'django.contrib.auth.middleware.AuthenticationMiddleware',
     'django.contrib.messages.middleware.MessageMiddleware',
-    'django.contrib.sessions.middleware.SessionMiddleware',
 )
 
 TEMPLATES = [{

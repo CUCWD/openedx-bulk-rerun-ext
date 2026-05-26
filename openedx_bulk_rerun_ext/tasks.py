@@ -13,7 +13,7 @@ def run_course_rerun(self, job_id):
     bind=True is required so self.retry() and self.request.retries are available.
     Retries up to 3 times with a 30-second delay before marking the job failed.
     """
-    from .models import CourseRerunJob
+    from .models import CourseRerunJob  # pylint: disable=import-outside-toplevel
 
     try:
         job = CourseRerunJob.objects.get(id=job_id)
@@ -34,6 +34,7 @@ def run_course_rerun(self, job_id):
     job.save(update_fields=update_fields)
 
     try:
+        # pylint: disable=import-outside-toplevel,import-error
         from cms.djangoapps.contentstore.tasks import rerun_course
         from common.djangoapps.course_action_state.models import CourseRerunState
         from opaque_keys.edx.keys import CourseKey
@@ -67,7 +68,7 @@ def run_course_rerun(self, job_id):
         job.completed_at = timezone.now()
         job.save(update_fields=['status', 'completed_at'])
 
-    except Exception as exc:
+    except Exception as exc:  # pylint: disable=broad-exception-caught
         # Check retry budget BEFORE calling self.retry() to avoid the
         # MaxRetriesExceededError trap: when retries are exhausted,
         # self.retry(exc=exc) re-raises the original exc (not

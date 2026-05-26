@@ -6,7 +6,7 @@ from rest_framework import serializers
 from .models import CourseRerunJob
 
 
-class ValidateKeysSerializer(serializers.Serializer):
+class ValidateKeysSerializer(serializers.Serializer):  # pylint: disable=abstract-method
     """Validates the request body for POST /api/bulk-rerun/validate/."""
 
     # 500 is an arbitrary ceiling that keeps the query and modulestore
@@ -18,7 +18,7 @@ class ValidateKeysSerializer(serializers.Serializer):
     )
 
 
-class CreateCourseRerunJobSerializer(serializers.Serializer):
+class CreateCourseRerunJobSerializer(serializers.Serializer):  # pylint: disable=abstract-method
     """Validates the request body for POST /api/bulk-rerun/jobs/."""
 
     source_course_key = serializers.CharField()
@@ -36,5 +36,7 @@ class CourseRerunJobSerializer(serializers.ModelSerializer):
     """Read-only serializer for returning CourseRerunJob state to the client."""
 
     class Meta:
+        """Bind the serializer to CourseRerunJob and expose all fields."""
+
         model = CourseRerunJob
         fields = '__all__'

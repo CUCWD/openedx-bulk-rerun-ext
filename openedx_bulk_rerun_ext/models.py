@@ -14,15 +14,23 @@ class CourseRerunJob(models.Model):
     One row is created per target course key. A bulk UI submission creates
     multiple rows that share the same bulk_job_id so they can be queried
     and displayed together.
+
+    .. no_pii: This model stores job metadata only. User identity is captured
+        as a foreign key reference to the auth.User model (handled separately).
+        Course keys, task IDs, and error messages contain no personal data.
     """
 
     class Status(models.TextChoices):
+        """Terminal and non-terminal lifecycle states for a rerun job."""
+
         PENDING = 'pending', 'Pending'
         RUNNING = 'running', 'Running'
         SUCCEEDED = 'succeeded', 'Succeeded'
         FAILED = 'failed', 'Failed'
 
     class JobType(models.TextChoices):
+        """Categorises the origin of a rerun request."""
+
         # Rerun from this org's prior year run.
         PROGRAM_RERUN = 'program_rerun', 'Program Rerun'
         # First-time org: clone from a Demo template course.
@@ -71,6 +79,8 @@ class CourseRerunJob(models.Model):
     error_message = models.TextField(blank=True, default='')
 
     class Meta:
+        """Default ordering and composite indexes for common query patterns."""
+
         ordering = ['-created_at']
         indexes = [
             # Supports the common query: "all jobs in this bulk submission with status X".

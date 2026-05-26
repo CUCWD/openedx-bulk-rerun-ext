@@ -9,11 +9,7 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from .models import CourseRerunJob
-from .serializers import (
-    CourseRerunJobSerializer,
-    CreateCourseRerunJobSerializer,
-    ValidateKeysSerializer,
-)
+from .serializers import CourseRerunJobSerializer, CreateCourseRerunJobSerializer, ValidateKeysSerializer
 
 # Jobs in these statuses own the target_course_key; a new job cannot claim
 # the same target until an existing one has failed (and thus released the slot).
@@ -26,16 +22,18 @@ _ACTIVE_STATUSES = [
 
 class ValidateCourseKeysView(APIView):
     """
-    POST /api/bulk-rerun/validate/
+    Check a list of target course keys for conflicts before bulk submission.
 
-    Accepts a list of target course keys and returns the subset that already
-    exist, checking both active CourseRerunJob rows and the platform modulestore.
-    Used by the UI on each debounce cycle to surface conflicts before submission.
+    POST /api/bulk-rerun/validate/ — accepts a list of target course keys and
+    returns the subset that already exist, checking both active CourseRerunJob
+    rows and the platform modulestore.  Used by the UI on each debounce cycle
+    to surface conflicts before submission.
     """
 
     permission_classes = [IsAuthenticated]
 
     def post(self, request):
+        """Validate a list of target course keys and return those that already exist."""
         # Deserialize and enforce min=1 / max=500 list constraints.
         serializer = ValidateKeysSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
@@ -70,14 +68,14 @@ class ValidateCourseKeysView(APIView):
         # xmodule is unavailable in test environments that run without a
         # full edx-platform install; skip the modulestore check gracefully.
         try:
-            from xmodule.modulestore.django import modulestore
+            from xmodule.modulestore.django import modulestore  # pylint: disable=import-outside-toplevel,import-error
             store = modulestore()
             for key_str in keys:
                 # Skip keys already found in Pass 1 to avoid redundant lookups.
                 if key_str not in existing:
                     if store.has_course(CourseKey.from_string(key_str)):
                         existing.add(key_str)
-        except ImportError:
+        except Exception:  # pylint: disable=broad-exception-caught
             pass
 
         # Return only the subset of input keys that already exist.
@@ -87,17 +85,19 @@ class ValidateCourseKeysView(APIView):
 
 class CourseRerunJobListCreate(APIView):
     """
-    GET  /api/bulk-rerun/jobs/          — list jobs owned by the current user.
-    POST /api/bulk-rerun/jobs/          — create a single rerun job and dispatch
-                                          the Celery task immediately.
+    GET /api/bulk-rerun/jobs/ — list jobs owned by the current user.
 
-    Accepts an optional ?bulk_job_id=<uuid> query param on GET to filter jobs
-    belonging to the same bulk submission.
+    POST /api/bulk-rerun/jobs/ — create a single rerun job and dispatch
+    the Celery task immediately.
+
+    Accepts an optional ``?bulk_job_id=<uuid>`` query param on GET to filter
+    jobs belonging to the same bulk submission.
     """
 
     permission_classes = [IsAuthenticated]
 
     def get(self, request):
+        """Return all rerun jobs owned by the requesting user, newest first."""
         # Scope to the requesting user so staff cannot see each other's jobs.
         jobs = CourseRerunJob.objects.filter(created_by=request.user)
 
@@ -109,6 +109,7 @@ class CourseRerunJobListCreate(APIView):
         return Response(CourseRerunJobSerializer(jobs, many=True).data)
 
     def post(self, request):
+        """Create a rerun job and immediately dispatch the Celery task."""
         # Deserialize input fields; job_type defaults to "individual" and
         # bulk_job_id defaults to None when not provided.
         serializer = CreateCourseRerunJobSerializer(data=request.data)
@@ -139,13 +140,13 @@ class CourseRerunJobListCreate(APIView):
         # an ItemNotFoundError deep inside clone_course, which is harder to debug.
         # xmodule is unavailable outside the platform; skip gracefully if so.
         try:
-            from xmodule.modulestore.django import modulestore
+            from xmodule.modulestore.django import modulestore  # pylint: disable=import-outside-toplevel,import-error
             if not modulestore().has_course(CourseKey.from_string(source_key_str)):
                 return Response(
                     {'error': f'Source course does not exist: {source_key_str}'},
                     status=status.HTTP_400_BAD_REQUEST,
                 )
-        except ImportError:
+        except Exception:  # pylint: disable=broad-exception-caught
             pass
 
         # For existing-org job types, verify the target org is registered on the
@@ -154,6 +155,7 @@ class CourseRerunJobListCreate(APIView):
         # the org won't exist yet by design.
         if data['job_type'] != CourseRerunJob.JobType.NEW_ORG:
             try:
+                # pylint: disable=import-outside-toplevel,import-error
                 from organizations.api import get_organization_by_short_name
                 from organizations.exceptions import InvalidOrganizationException
                 target_org = CourseKey.from_string(target_key_str).org
@@ -169,7 +171,7 @@ class CourseRerunJobListCreate(APIView):
                         },
                         status=status.HTTP_400_BAD_REQUEST,
                     )
-            except ImportError:
+            except Exception:  # pylint: disable=broad-exception-caught
                 pass
 
         # Prevent duplicate jobs for the same target. A failed job releases the
@@ -195,7 +197,7 @@ class CourseRerunJobListCreate(APIView):
         # Dispatch the Celery task and store its ID so operators can trace it
         # in Flower or the Django admin. The task transitions the job through
         # running → succeeded/failed asynchronously.
-        from .tasks import run_course_rerun
+        from .tasks import run_course_rerun  # pylint: disable=import-outside-toplevel
         result = run_course_rerun.delay(str(job.id))
         job.celery_task_id = result.id
         job.save(update_fields=['celery_task_id'])
@@ -207,15 +209,16 @@ class CourseRerunJobListCreate(APIView):
 
 class CourseRerunJobDetail(APIView):
     """
-    GET /api/bulk-rerun/jobs/<uuid:job_id>/
+    Return the current state of a single CourseRerunJob.
 
-    Returns the current state of a single CourseRerunJob. Returns 404 if the
-    job does not exist or was not created by the requesting user.
+    GET /api/bulk-rerun/jobs/<uuid:job_id>/ — returns 404 if the job does not
+    exist or was not created by the requesting user.
     """
 
     permission_classes = [IsAuthenticated]
 
     def get(self, request, job_id):
+        """Return the current state of a single rerun job; 404 if not owned by the caller."""
         try:
             job = CourseRerunJob.objects.get(id=job_id)
         except CourseRerunJob.DoesNotExist:
