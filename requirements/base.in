@@ -1,7 +1,10 @@
 # Core requirements for using this application
 -c constraints.txt
 
-Django             # Web application framework
-
+Django
+celery
+djangorestframework
+edx-django-utils
+edx-opaque-keys
 
 openedx-atlas
