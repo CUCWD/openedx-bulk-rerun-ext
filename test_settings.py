@@ -44,9 +44,9 @@ ROOT_URLCONF = 'openedx_bulk_rerun_ext.urls'
 SECRET_KEY = 'insecure-secret-key'
 
 MIDDLEWARE = (
-    'django.contrib.auth.middleware.AuthenticationMiddleware',
     'django.contrib.messages.middleware.MessageMiddleware',
     'django.contrib.sessions.middleware.SessionMiddleware',
+    'django.contrib.auth.middleware.AuthenticationMiddleware',
 )
 
 TEMPLATES = [{
@@ -59,3 +59,5 @@ TEMPLATES = [{
         ],
     },
 }]
+
+DEBUG = True
