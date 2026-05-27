@@ -12,6 +12,7 @@ class OpenedxBulkRerunExtConfig(AppConfig):
     """
 
     name = 'openedx_bulk_rerun_ext'
+    default_auto_field = 'django.db.models.BigAutoField'
 
     plugin_app = {
         PluginURLs.CONFIG: {

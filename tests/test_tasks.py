@@ -1,5 +1,5 @@
 """
-Tests for the run_course_rerun Celery task.
+Tests for the run_course_rerun and dispatch_batch_rerun Celery tasks.
 
 edx-platform modules (rerun_course, CourseRerunState) are injected via
 sys.modules so they never need to be installed in the test environment.
@@ -13,8 +13,8 @@ import pytest
 from django.contrib.auth import get_user_model
 from django.utils import timezone
 
-from openedx_bulk_rerun_ext.models import CourseRerunJob
-from openedx_bulk_rerun_ext.tasks import run_course_rerun
+from openedx_bulk_rerun_ext.models import BulkRerunBatch, CourseRerunJob, CourseRerunLog
+from openedx_bulk_rerun_ext.tasks import _check_batch_completion, dispatch_batch_rerun, run_course_rerun
 
 User = get_user_model()
 pytestmark = pytest.mark.django_db
@@ -75,12 +75,32 @@ def job(user):
     )
 
 
-# ── Guard-rail tests (no platform calls needed) ───────────────────────────────
+@pytest.fixture
+def batch(user):
+    return BulkRerunBatch.objects.create(
+        created_by=user,
+        mode=BulkRerunBatch.Mode.INDIVIDUAL,
+        target_run='2026_2027',
+    )
+
+
+@pytest.fixture
+def batch_job(user, batch):
+    return CourseRerunJob.objects.create(
+        source_course_key=SOURCE_KEY,
+        target_course_key=TARGET_KEY,
+        created_by=user,
+        batch=batch,
+        position=0,
+    )
+
+
+# ── Phase 1: guard-rail tests ─────────────────────────────────────────────────
 
 class TestEarlyReturns:
     """Task aborts silently for non-existent or already-terminal jobs."""
+
     def test_nonexistent_job_id_does_not_raise(self):
-        # Task should silently abort when the job row is gone (e.g. race condition).
         run_course_rerun.apply(args=['00000000-0000-0000-0000-000000000000'])
 
     def test_succeeded_job_is_skipped(self, job):
@@ -98,10 +118,11 @@ class TestEarlyReturns:
         assert job.status == CourseRerunJob.Status.FAILED  # unchanged
 
 
-# ── Success path ──────────────────────────────────────────────────────────────
+# ── Phase 1: success path ─────────────────────────────────────────────────────
 
 class TestSuccessPath:
     """Job transitions to SUCCEEDED and all fields are written correctly."""
+
     def test_job_marked_succeeded(self, job, rerun_course_mock):
         run_course_rerun.apply(args=[str(job.id)])
         job.refresh_from_db()
@@ -118,12 +139,10 @@ class TestSuccessPath:
         assert job.started_at is not None
 
     def test_started_at_not_overwritten_on_retry(self, job, rerun_course_mock):
-        # Prime the job with an existing started_at so a retry can't overwrite it.
         t0 = timezone.now()
         job.started_at = t0
         job.status = CourseRerunJob.Status.RUNNING
         job.save()
-
         run_course_rerun.apply(args=[str(job.id)])
         job.refresh_from_db()
         assert job.started_at == t0
@@ -145,12 +164,12 @@ class TestSuccessPath:
         assert job.error_message == ''
 
 
-# ── Failure path ──────────────────────────────────────────────────────────────
+# ── Phase 1: failure path ─────────────────────────────────────────────────────
 
 class TestFailurePath:
     """Job transitions to FAILED after all retries are exhausted."""
+
     def test_job_marked_failed_after_all_retries(self, job, rerun_course_mock):
-        # rerun_course returns a non-'succeeded' string, triggering RuntimeError.
         rerun_course_mock.apply.return_value = MagicMock(result='duplicate course')
         run_course_rerun.apply(args=[str(job.id)])
         job.refresh_from_db()
@@ -169,16 +188,214 @@ class TestFailurePath:
         assert job.completed_at is not None
 
     def test_rerun_course_retried_up_to_max(self, job, rerun_course_mock):
-        # With max_retries=3 there are 4 total attempts (1 initial + 3 retries).
         rerun_course_mock.apply.return_value = MagicMock(result='exception: something')
         run_course_rerun.apply(args=[str(job.id)])
         assert rerun_course_mock.apply.call_count == 4
 
     def test_exception_from_rerun_course_apply_triggers_failure(self, job, rerun_course_mock):
-        # If rerun_course.apply() itself raises (rather than returning an error
-        # string), the job should still end up FAILED, not RUNNING.
         rerun_course_mock.apply.side_effect = RuntimeError('boom')
         run_course_rerun.apply(args=[str(job.id)])
         job.refresh_from_db()
         assert job.status == CourseRerunJob.Status.FAILED
         assert 'boom' in job.error_message
+
+
+# ── Phase 2: log output ───────────────────────────────────────────────────────
+
+class TestRunCourseRerunLogging:
+    """run_course_rerun writes structured log lines to CourseRerunLog."""
+
+    def test_log_lines_written_on_success(self, job, rerun_course_mock):
+        run_course_rerun.apply(args=[str(job.id)])
+        assert job.logs.count() > 0
+
+    def test_first_log_is_provisioning_created(self, job, rerun_course_mock):
+        run_course_rerun.apply(args=[str(job.id)])
+        first = job.logs.first()
+        assert 'ProvisioningJob created' in first.message
+
+    def test_success_log_written_on_success(self, job, rerun_course_mock):
+        run_course_rerun.apply(args=[str(job.id)])
+        ok_logs = job.logs.filter(level=CourseRerunLog.Level.OK)
+        assert ok_logs.exists()
+
+    def test_error_log_written_on_failure(self, job, rerun_course_mock):
+        rerun_course_mock.apply.return_value = MagicMock(result='duplicate course')
+        run_course_rerun.apply(args=[str(job.id)])
+        err_logs = job.logs.filter(level=CourseRerunLog.Level.ERR)
+        assert err_logs.exists()
+
+    def test_error_log_contains_failure_reason(self, job, rerun_course_mock):
+        rerun_course_mock.apply.return_value = MagicMock(result='duplicate course')
+        run_course_rerun.apply(args=[str(job.id)])
+        err_log = job.logs.filter(level=CourseRerunLog.Level.ERR).first()
+        assert 'duplicate course' in err_log.message
+
+
+# ── Phase 2: dry-run mode ─────────────────────────────────────────────────────
+
+class TestRunCourseRerunDryRun:
+    """Dry-run jobs write logs but never call rerun_course.apply()."""
+
+    def test_dry_run_does_not_call_rerun_course(self, batch_job, rerun_course_mock):
+        batch_job.batch.is_dry_run = True
+        batch_job.batch.save()
+        run_course_rerun.apply(args=[str(batch_job.id)])
+        rerun_course_mock.apply.assert_not_called()
+
+    def test_dry_run_marks_job_succeeded(self, batch_job, rerun_course_mock):
+        batch_job.batch.is_dry_run = True
+        batch_job.batch.save()
+        run_course_rerun.apply(args=[str(batch_job.id)])
+        batch_job.refresh_from_db()
+        assert batch_job.status == CourseRerunJob.Status.SUCCEEDED
+
+    def test_dry_run_logs_contain_dry_run_prefix(self, batch_job, rerun_course_mock):
+        batch_job.batch.is_dry_run = True
+        batch_job.batch.save()
+        run_course_rerun.apply(args=[str(batch_job.id)])
+        messages = list(batch_job.logs.values_list('message', flat=True))
+        assert any('[DRY-RUN]' in m for m in messages)
+
+    def test_dry_run_completion_log_written(self, batch_job, rerun_course_mock):
+        batch_job.batch.is_dry_run = True
+        batch_job.batch.save()
+        run_course_rerun.apply(args=[str(batch_job.id)])
+        ok_logs = batch_job.logs.filter(level=CourseRerunLog.Level.OK)
+        assert any('Dry-run complete' in m for m in ok_logs.values_list('message', flat=True))
+
+
+# ── Phase 2: batch completion rollup ─────────────────────────────────────────
+
+class TestCheckBatchCompletion:
+    """_check_batch_completion rolls up batch status correctly."""
+
+    def test_batch_succeeded_when_all_jobs_succeeded(self, user, batch):
+        for i in range(2):
+            j = CourseRerunJob.objects.create(
+                source_course_key=SOURCE_KEY,
+                target_course_key=f'course-v1:ORG+TEST+{i}',
+                created_by=user, batch=batch,
+            )
+            j.status = CourseRerunJob.Status.SUCCEEDED
+            j.save()
+        _check_batch_completion(str(batch.id))
+        batch.refresh_from_db()
+        assert batch.status == BulkRerunBatch.Status.SUCCEEDED
+        assert batch.completed_at is not None
+
+    def test_batch_failed_when_all_jobs_failed(self, user, batch):
+        for i in range(2):
+            j = CourseRerunJob.objects.create(
+                source_course_key=SOURCE_KEY,
+                target_course_key=f'course-v1:ORG+TEST+{i}',
+                created_by=user, batch=batch,
+            )
+            j.status = CourseRerunJob.Status.FAILED
+            j.save()
+        _check_batch_completion(str(batch.id))
+        batch.refresh_from_db()
+        assert batch.status == BulkRerunBatch.Status.FAILED
+
+    def test_batch_partial_when_some_jobs_failed(self, user, batch):
+        for status, key in [(CourseRerunJob.Status.SUCCEEDED, '0'), (CourseRerunJob.Status.FAILED, '1')]:
+            j = CourseRerunJob.objects.create(
+                source_course_key=SOURCE_KEY,
+                target_course_key=f'course-v1:ORG+TEST+{key}',
+                created_by=user, batch=batch,
+            )
+            j.status = status
+            j.save()
+        _check_batch_completion(str(batch.id))
+        batch.refresh_from_db()
+        assert batch.status == BulkRerunBatch.Status.PARTIAL
+
+    def test_batch_not_updated_while_jobs_still_running(self, user, batch):
+        j = CourseRerunJob.objects.create(
+            source_course_key=SOURCE_KEY,
+            target_course_key='course-v1:ORG+TEST+0',
+            created_by=user, batch=batch,
+        )
+        j.status = CourseRerunJob.Status.RUNNING
+        j.save()
+        _check_batch_completion(str(batch.id))
+        batch.refresh_from_db()
+        assert batch.status == BulkRerunBatch.Status.PENDING  # unchanged
+
+    def test_nonexistent_batch_does_not_raise(self):
+        _check_batch_completion('00000000-0000-0000-0000-000000000000')
+
+
+class TestRunCourseRerunBatchCompletion:
+    """run_course_rerun triggers batch rollup after the job reaches a terminal state."""
+
+    def test_batch_completed_after_last_job_succeeds(self, batch_job, rerun_course_mock):
+        run_course_rerun.apply(args=[str(batch_job.id)])
+        batch_job.batch.refresh_from_db()
+        assert batch_job.batch.status == BulkRerunBatch.Status.SUCCEEDED
+
+    def test_batch_completed_after_last_job_fails(self, batch_job, rerun_course_mock):
+        rerun_course_mock.apply.return_value = MagicMock(result='duplicate course')
+        run_course_rerun.apply(args=[str(batch_job.id)])
+        batch_job.batch.refresh_from_db()
+        assert batch_job.batch.status == BulkRerunBatch.Status.FAILED
+
+
+# ── Phase 2: dispatch_batch_rerun ─────────────────────────────────────────────
+
+class TestDispatchBatchRerun:
+    """dispatch_batch_rerun marks the batch running and schedules child tasks."""
+
+    def test_batch_marked_running(self, user, batch):
+        CourseRerunJob.objects.create(
+            source_course_key=SOURCE_KEY,
+            target_course_key=TARGET_KEY,
+            created_by=user, batch=batch, position=0,
+        )
+        with patch('openedx_bulk_rerun_ext.tasks.run_course_rerun.apply_async'):
+            dispatch_batch_rerun.apply(args=[str(batch.id)])
+        batch.refresh_from_db()
+        assert batch.status == BulkRerunBatch.Status.RUNNING
+
+    def test_child_task_dispatched_per_job(self, user, batch):
+        for i in range(3):
+            CourseRerunJob.objects.create(
+                source_course_key=SOURCE_KEY,
+                target_course_key=f'course-v1:ORG+TEST+{i}',
+                created_by=user, batch=batch, position=i,
+            )
+        with patch('openedx_bulk_rerun_ext.tasks.run_course_rerun.apply_async') as mock_async:
+            dispatch_batch_rerun.apply(args=[str(batch.id)])
+        assert mock_async.call_count == 3
+
+    def test_countdown_staggered_by_position(self, user, batch):
+        for i in range(2):
+            CourseRerunJob.objects.create(
+                source_course_key=SOURCE_KEY,
+                target_course_key=f'course-v1:ORG+TEST+{i}',
+                created_by=user, batch=batch, position=i,
+            )
+        with patch('openedx_bulk_rerun_ext.tasks.run_course_rerun.apply_async') as mock_async:
+            dispatch_batch_rerun.apply(args=[str(batch.id)])
+        countdowns = [call.kwargs['countdown'] for call in mock_async.call_args_list]
+        assert countdowns == [0, 2]
+
+    def test_nonexistent_batch_does_not_raise(self):
+        dispatch_batch_rerun.apply(args=['00000000-0000-0000-0000-000000000000'])
+
+    def test_only_pending_jobs_are_dispatched(self, user, batch):
+        running_job = CourseRerunJob.objects.create(
+            source_course_key=SOURCE_KEY,
+            target_course_key='course-v1:ORG+TEST+0',
+            created_by=user, batch=batch, position=0,
+        )
+        running_job.status = CourseRerunJob.Status.RUNNING
+        running_job.save()
+        CourseRerunJob.objects.create(
+            source_course_key=SOURCE_KEY,
+            target_course_key='course-v1:ORG+TEST+1',
+            created_by=user, batch=batch, position=1,
+        )
+        with patch('openedx_bulk_rerun_ext.tasks.run_course_rerun.apply_async') as mock_async:
+            dispatch_batch_rerun.apply(args=[str(batch.id)])
+        assert mock_async.call_count == 1
