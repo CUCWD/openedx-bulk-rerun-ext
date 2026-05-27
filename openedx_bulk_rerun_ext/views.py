@@ -8,8 +8,15 @@ from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
-from .models import CourseRerunJob
-from .serializers import CourseRerunJobSerializer, CreateCourseRerunJobSerializer, ValidateKeysSerializer
+from .models import BulkRerunBatch, CourseRerunJob
+from .serializers import (
+    BulkRerunBatchCreateSerializer,
+    BulkRerunBatchSerializer,
+    CourseRerunJobSerializer,
+    CourseRerunLogSerializer,
+    CreateCourseRerunJobSerializer,
+    ValidateKeysSerializer,
+)
 
 # Jobs in these statuses own the target_course_key; a new job cannot claim
 # the same target until an existing one has failed (and thus released the slot).
@@ -18,6 +25,9 @@ _ACTIVE_STATUSES = [
     CourseRerunJob.Status.RUNNING,
     CourseRerunJob.Status.SUCCEEDED,
 ]
+
+
+# ── Phase 1 views ─────────────────────────────────────────────────────────────
 
 
 class ValidateCourseKeysView(APIView):
@@ -85,6 +95,8 @@ class ValidateCourseKeysView(APIView):
 
 class CourseRerunJobListCreate(APIView):
     """
+    List and create individual rerun jobs.
+
     GET /api/bulk-rerun/jobs/ — list jobs owned by the current user.
 
     POST /api/bulk-rerun/jobs/ — create a single rerun job and dispatch
@@ -230,3 +242,141 @@ class CourseRerunJobDetail(APIView):
             return Response(status=status.HTTP_404_NOT_FOUND)
 
         return Response(CourseRerunJobSerializer(job).data)
+
+
+# ── Phase 2 views ─────────────────────────────────────────────────────────────
+
+class BulkRerunBatchListCreateView(APIView):
+    """
+    Submit a full bulk rerun batch from the UI.
+
+    POST /api/bulk-rerun/batches/ — creates one BulkRerunBatch and N
+    CourseRerunJob rows, then dispatches the fan-out Celery task.
+    Returns 202 Accepted with the batch ID and initial job list.
+    """
+
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        """Validate the batch payload, create all rows, and dispatch the fan-out task."""
+        serializer = BulkRerunBatchCreateSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+
+        # Reject any target key that already has an active or succeeded job.
+        target_keys = [c['target_course_key'] for c in data['courses']]
+        blocked = set(
+            CourseRerunJob.objects.filter(
+                target_course_key__in=target_keys,
+                status__in=_ACTIVE_STATUSES,
+            ).values_list('target_course_key', flat=True)
+        )
+        if blocked:
+            return Response(
+                {'error': 'Active jobs already exist for these target keys', 'keys': sorted(blocked)},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        batch = BulkRerunBatch.objects.create(
+            created_by=request.user,
+            mode=data['mode'],
+            is_dry_run=data['is_dry_run'],
+            target_run=data['target_run'],
+            prog_id=data.get('prog_id', ''),
+        )
+
+        jobs = []
+        for position, course in enumerate(data['courses']):
+            job = CourseRerunJob.objects.create(
+                batch=batch,
+                position=position,
+                source_course_key=course['source_course_key'],
+                target_course_key=course['target_course_key'],
+                job_type=course['job_type'],
+                created_by=request.user,
+            )
+            jobs.append(job)
+
+        from .tasks import dispatch_batch_rerun  # pylint: disable=import-outside-toplevel
+        dispatch_batch_rerun.delay(str(batch.id))
+
+        return Response(
+            {
+                'batch_id':   str(batch.id),
+                'status':     batch.status,
+                'total_jobs': len(jobs),
+                'jobs': [
+                    {
+                        'id':                str(j.id),
+                        'target_course_key': j.target_course_key,
+                        'status':            j.status,
+                    }
+                    for j in jobs
+                ],
+            },
+            status=status.HTTP_202_ACCEPTED,
+        )
+
+
+class BulkRerunBatchDetailView(APIView):
+    """
+    Return the full status of a batch including per-course job state.
+
+    GET /api/bulk-rerun/batches/<uuid:batch_id>/ — polled every 2 seconds by
+    the UI Track Progress screen.  Returns 404 if the batch does not exist or
+    was not created by the requesting user.
+    """
+
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, batch_id):
+        """Return batch status and the nested job list; 404 if not owned by the caller."""
+        try:
+            batch = BulkRerunBatch.objects.get(id=batch_id)
+        except BulkRerunBatch.DoesNotExist:
+            return Response(status=status.HTTP_404_NOT_FOUND)
+
+        if batch.created_by != request.user:
+            return Response(status=status.HTTP_404_NOT_FOUND)
+
+        return Response(BulkRerunBatchSerializer(batch).data)
+
+
+class CourseRerunJobLogsView(APIView):
+    """
+    Return structured log lines for a single CourseRerunJob.
+
+    GET /api/bulk-rerun/jobs/<uuid:job_id>/logs/ — returns all log lines.
+    Supports ``?since=<id>`` for incremental polling; only lines with
+    id > since are returned, avoiding re-fetching the full history.
+    Returns 404 if the job does not exist or was not created by the caller.
+    """
+
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, job_id):
+        """Return log lines for a job, optionally filtered to those newer than ?since=<id>."""
+        try:
+            job = CourseRerunJob.objects.get(id=job_id)
+        except CourseRerunJob.DoesNotExist:
+            return Response(status=status.HTTP_404_NOT_FOUND)
+
+        if job.created_by != request.user:
+            return Response(status=status.HTTP_404_NOT_FOUND)
+
+        logs = job.logs.all()
+        since = request.query_params.get('since')
+        if since:
+            try:
+                logs = logs.filter(id__gt=int(since))
+            except (TypeError, ValueError):
+                return Response(
+                    {'error': 'since must be an integer log line ID'},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+        return Response({
+            'job_id':     str(job.id),
+            'job_status': job.status,
+            'logs':       CourseRerunLogSerializer(logs, many=True).data,
+        })
