@@ -21,7 +21,7 @@ from django.urls import reverse
 from django.utils import timezone
 from rest_framework.test import APIClient
 
-from openedx_bulk_rerun_ext.models import BulkRerunBatch, CourseRerunJob, CourseRerunLog
+from openedx_bulk_rerun_ext.models import BulkRerunBatch, CourseRerunJob, CourseRerunLog, CourseRerunSettings
 
 User = get_user_model()
 pytestmark = pytest.mark.django_db
@@ -398,7 +398,7 @@ class TestCourseRerunJobDetail:
             'started_at', 'completed_at', 'status', 'job_type',
             'source_course_key', 'target_course_key',
             'celery_task_id', 'error_message',
-            'batch', 'position',
+            'batch', 'position', 'settings_applied',
         }
         assert expected_fields == set(resp.data.keys())
 
@@ -409,6 +409,22 @@ class TestBulkRerunBatchCreate:
     """POST /batches/ — create a batch and fan out child jobs."""
 
     URL = '/batches/'
+
+    _DEFAULT_SETTINGS = {
+        'course_start': '2025-08-01T00:00:00Z',
+        'course_end': '2026-07-31T23:59:59Z',
+        'enrollment_start': '2025-08-01T00:00:00Z',
+        'enrollment_end': '2026-07-31T23:59:59Z',
+        'pacing': 'instructor',
+        'course_mode': 'honor',
+        'cert_display': 'early_no_info',
+        'create_cert': True,
+        'student_gen_cert': True,
+        'cert_on_dashboard': True,
+        'gating_mode': 'disabled',
+        'gating_template_id': '',
+        'remove_provisioner_after': True,
+    }
 
     def _payload(self, **overrides):  # pylint: disable=missing-function-docstring
         data = {
@@ -422,6 +438,8 @@ class TestBulkRerunBatchCreate:
                     'job_type': 'individual',
                 }
             ],
+            'settings': self._DEFAULT_SETTINGS,
+            'team_members': [],
         }
         data.update(overrides)
         return data
@@ -641,3 +659,96 @@ class TestCourseRerunJobLogsView:
         )
         resp = auth_client.get(self._url(other_job.id))
         assert resp.status_code == 404
+
+
+# ── Phase 3: POST /batches/ — settings and team members ──────────────────────
+
+class TestBulkRerunBatchCreatePhase3(TestBulkRerunBatchCreate):
+    """POST /batches/ creates CourseRerunSettings and CourseRerunTeamMember rows."""
+
+    def test_settings_row_created_in_db(self, auth_client, mock_batch_task):
+        resp = auth_client.post(self.URL, self._payload(), format='json')
+        assert resp.status_code == 202
+        batch = BulkRerunBatch.objects.get(id=resp.data['batch_id'])
+        assert CourseRerunSettings.objects.filter(batch=batch).exists()
+
+    def test_settings_fields_stored_correctly(self, auth_client, mock_batch_task):
+        resp = auth_client.post(self.URL, self._payload(), format='json')
+        batch = BulkRerunBatch.objects.get(id=resp.data['batch_id'])
+        s = batch.settings
+        assert s.pacing == 'instructor'
+        assert s.course_mode == 'honor'
+        assert s.gating_mode == 'disabled'
+        assert s.remove_provisioner_after is True
+
+    def test_team_member_rows_created_in_db(self, auth_client, mock_batch_task):
+        payload = self._payload(team_members=[
+            {'email': 'inst@example.com', 'studio_role': 'admin', 'discussion_role': 'discussion_admin'},
+        ])
+        resp = auth_client.post(self.URL, payload, format='json')
+        assert resp.status_code == 202
+        batch = BulkRerunBatch.objects.get(id=resp.data['batch_id'])
+        assert batch.team_members.filter(email='inst@example.com').exists()
+
+    def test_empty_team_members_list_is_accepted(self, auth_client, mock_batch_task):
+        resp = auth_client.post(self.URL, self._payload(team_members=[]), format='json')
+        assert resp.status_code == 202
+
+    def test_missing_settings_returns_400(self, auth_client, mock_batch_task):
+        payload = self._payload()
+        del payload['settings']
+        resp = auth_client.post(self.URL, payload, format='json')
+        assert resp.status_code == 400
+
+    def test_start_after_end_returns_400(self, auth_client, mock_batch_task):
+        bad_settings = dict(self._DEFAULT_SETTINGS)
+        bad_settings['course_start'] = '2027-01-01T00:00:00Z'
+        bad_settings['course_end'] = '2026-01-01T00:00:00Z'
+        resp = auth_client.post(self.URL, self._payload(settings=bad_settings), format='json')
+        assert resp.status_code == 400
+
+    def test_enrollment_start_after_course_start_returns_400(self, auth_client, mock_batch_task):
+        bad_settings = dict(self._DEFAULT_SETTINGS)
+        bad_settings['enrollment_start'] = '2026-01-01T00:00:00Z'
+        resp = auth_client.post(self.URL, self._payload(settings=bad_settings), format='json')
+        assert resp.status_code == 400
+
+
+# ── Phase 3: GET /batches/<uuid>/ — settings_applied_count ───────────────────
+
+class TestBulkRerunBatchDetailPhase3:
+    """GET /batches/<uuid>/ includes settings_applied_count in the response."""
+
+    def _url(self, batch_id):
+        return reverse('bulk_rerun:batches-detail', kwargs={'batch_id': batch_id})
+
+    def test_settings_applied_count_in_response(self, auth_client, existing_batch):
+        resp = auth_client.get(self._url(existing_batch.id))
+        assert resp.status_code == 200
+        assert 'settings_applied_count' in resp.data
+
+    def test_settings_applied_count_is_zero_initially(self, auth_client, user, existing_batch):
+        CourseRerunJob.objects.create(
+            source_course_key=SOURCE_KEY, target_course_key=TARGET_KEY,
+            created_by=user, batch=existing_batch,
+        )
+        resp = auth_client.get(self._url(existing_batch.id))
+        assert resp.data['settings_applied_count'] == 0
+
+    def test_settings_applied_count_increments(self, auth_client, user, existing_batch):
+        j = CourseRerunJob.objects.create(
+            source_course_key=SOURCE_KEY, target_course_key=TARGET_KEY,
+            created_by=user, batch=existing_batch,
+        )
+        j.settings_applied = True
+        j.save()
+        resp = auth_client.get(self._url(existing_batch.id))
+        assert resp.data['settings_applied_count'] == 1
+
+    def test_settings_applied_in_job_fields(self, auth_client, user, existing_batch):
+        CourseRerunJob.objects.create(
+            source_course_key=SOURCE_KEY, target_course_key=TARGET_KEY,
+            created_by=user, batch=existing_batch,
+        )
+        resp = auth_client.get(self._url(existing_batch.id))
+        assert 'settings_applied' in resp.data['jobs'][0]

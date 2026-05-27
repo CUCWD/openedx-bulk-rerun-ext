@@ -13,8 +13,13 @@ import pytest
 from django.contrib.auth import get_user_model
 from django.utils import timezone
 
-from openedx_bulk_rerun_ext.models import BulkRerunBatch, CourseRerunJob, CourseRerunLog
-from openedx_bulk_rerun_ext.tasks import _check_batch_completion, dispatch_batch_rerun, run_course_rerun
+from openedx_bulk_rerun_ext.models import BulkRerunBatch, CourseRerunJob, CourseRerunLog, CourseRerunSettings
+from openedx_bulk_rerun_ext.tasks import (
+    _check_batch_completion,
+    apply_course_settings,
+    dispatch_batch_rerun,
+    run_course_rerun,
+)
 
 User = get_user_model()
 pytestmark = pytest.mark.django_db
@@ -92,6 +97,20 @@ def batch_job(user, batch):
         created_by=user,
         batch=batch,
         position=0,
+    )
+
+
+@pytest.fixture
+def settings_obj(batch):
+    """CourseRerunSettings row for batch; triggers the applicator path in apply_course_settings."""
+    now = timezone.now()
+    return CourseRerunSettings.objects.create(
+        batch=batch,
+        course_start=now,
+        course_end=now.replace(year=now.year + 1),
+        enrollment_start=now,
+        enrollment_end=now.replace(year=now.year + 1),
+        remove_provisioner_after=False,
     )
 
 
@@ -399,3 +418,143 @@ class TestDispatchBatchRerun:
         with patch('openedx_bulk_rerun_ext.tasks.run_course_rerun.apply_async') as mock_async:
             dispatch_batch_rerun.apply(args=[str(batch.id)])
         assert mock_async.call_count == 1
+
+
+# ── Phase 3: apply_course_settings — no settings row ─────────────────────────
+
+class TestApplyCourseSettingsNoSettings:
+    """apply_course_settings finalizes immediately when the batch has no settings row."""
+
+    def test_job_marked_succeeded_for_standalone_job(self, job):
+        job.status = CourseRerunJob.Status.RUNNING
+        job.save()
+        apply_course_settings.apply(args=[str(job.id)])
+        job.refresh_from_db()
+        assert job.status == CourseRerunJob.Status.SUCCEEDED
+
+    def test_job_marked_succeeded_for_batch_without_settings(self, batch_job):
+        batch_job.status = CourseRerunJob.Status.RUNNING
+        batch_job.save()
+        apply_course_settings.apply(args=[str(batch_job.id)])
+        batch_job.refresh_from_db()
+        assert batch_job.status == CourseRerunJob.Status.SUCCEEDED
+
+    def test_completion_log_written(self, batch_job):
+        batch_job.status = CourseRerunJob.Status.RUNNING
+        batch_job.save()
+        apply_course_settings.apply(args=[str(batch_job.id)])
+        ok_logs = batch_job.logs.filter(level=CourseRerunLog.Level.OK)
+        assert ok_logs.filter(message__icontains='Course creation complete').exists()
+
+    def test_dry_run_log_written_when_no_settings(self, batch_job):
+        batch_job.batch.is_dry_run = True
+        batch_job.batch.save()
+        batch_job.status = CourseRerunJob.Status.RUNNING
+        batch_job.save()
+        apply_course_settings.apply(args=[str(batch_job.id)])
+        ok_logs = list(batch_job.logs.filter(level=CourseRerunLog.Level.OK).values_list('message', flat=True))
+        assert any('Dry-run complete' in m for m in ok_logs)
+
+    def test_nonexistent_job_does_not_raise(self):
+        apply_course_settings.apply(args=['00000000-0000-0000-0000-000000000000'])
+
+    def test_terminal_job_is_skipped(self, job):
+        job.status = CourseRerunJob.Status.SUCCEEDED
+        job.save()
+        apply_course_settings.apply(args=[str(job.id)])
+        assert job.logs.count() == 0
+
+
+# ── Phase 3: apply_course_settings — with settings row ───────────────────────
+
+class TestApplyCourseSettingsWithSettings:
+    """apply_course_settings runs applicators and sets settings_applied when a settings row exists."""
+
+    def test_job_marked_succeeded(self, batch_job, settings_obj):
+        batch_job.status = CourseRerunJob.Status.RUNNING
+        batch_job.save()
+        apply_course_settings.apply(args=[str(batch_job.id)])
+        batch_job.refresh_from_db()
+        assert batch_job.status == CourseRerunJob.Status.SUCCEEDED
+
+    def test_settings_applied_flag_set(self, batch_job, settings_obj):
+        batch_job.status = CourseRerunJob.Status.RUNNING
+        batch_job.save()
+        apply_course_settings.apply(args=[str(batch_job.id)])
+        batch_job.refresh_from_db()
+        assert batch_job.settings_applied is True
+
+    def test_completion_log_written(self, batch_job, settings_obj):
+        batch_job.status = CourseRerunJob.Status.RUNNING
+        batch_job.save()
+        apply_course_settings.apply(args=[str(batch_job.id)])
+        ok_logs = batch_job.logs.filter(level=CourseRerunLog.Level.OK)
+        assert ok_logs.filter(message__icontains='Course creation complete').exists()
+
+    def test_batch_completion_triggered(self, batch_job, settings_obj):
+        batch_job.status = CourseRerunJob.Status.RUNNING
+        batch_job.save()
+        apply_course_settings.apply(args=[str(batch_job.id)])
+        batch_job.batch.refresh_from_db()
+        assert batch_job.batch.status == BulkRerunBatch.Status.SUCCEEDED
+
+
+# ── Phase 3: apply_course_settings — dry-run with settings ───────────────────
+
+class TestApplyCourseSettingsDryRun:
+    """apply_course_settings writes [DRY-RUN] logs but skips platform calls."""
+
+    def test_dry_run_logs_contain_dry_run_prefix(self, batch_job, settings_obj):
+        batch_job.batch.is_dry_run = True
+        batch_job.batch.save()
+        batch_job.status = CourseRerunJob.Status.RUNNING
+        batch_job.save()
+        apply_course_settings.apply(args=[str(batch_job.id)])
+        messages = list(batch_job.logs.values_list('message', flat=True))
+        assert any('[DRY-RUN]' in m for m in messages)
+
+    def test_dry_run_marks_job_succeeded(self, batch_job, settings_obj):
+        batch_job.batch.is_dry_run = True
+        batch_job.batch.save()
+        batch_job.status = CourseRerunJob.Status.RUNNING
+        batch_job.save()
+        apply_course_settings.apply(args=[str(batch_job.id)])
+        batch_job.refresh_from_db()
+        assert batch_job.status == CourseRerunJob.Status.SUCCEEDED
+
+    def test_dry_run_sets_settings_applied(self, batch_job, settings_obj):
+        batch_job.batch.is_dry_run = True
+        batch_job.batch.save()
+        batch_job.status = CourseRerunJob.Status.RUNNING
+        batch_job.save()
+        apply_course_settings.apply(args=[str(batch_job.id)])
+        batch_job.refresh_from_db()
+        assert batch_job.settings_applied is True
+
+
+# ── Phase 3: apply_course_settings — failure ─────────────────────────────────
+
+class TestApplyCourseSettingsFailure:
+    """apply_course_settings marks job failed after max retries are exhausted."""
+
+    def test_job_marked_failed_on_unrecoverable_error(self, batch_job, settings_obj):
+        batch_job.status = CourseRerunJob.Status.RUNNING
+        batch_job.save()
+        with patch(
+            'openedx_bulk_rerun_ext.applicators.apply_scheduling',
+            side_effect=RuntimeError('scheduling boom'),
+        ):
+            apply_course_settings.apply(args=[str(batch_job.id)])
+        batch_job.refresh_from_db()
+        assert batch_job.status == CourseRerunJob.Status.FAILED
+        assert 'scheduling boom' in batch_job.error_message
+
+    def test_error_log_written_on_failure(self, batch_job, settings_obj):
+        batch_job.status = CourseRerunJob.Status.RUNNING
+        batch_job.save()
+        with patch(
+            'openedx_bulk_rerun_ext.applicators.apply_scheduling',
+            side_effect=RuntimeError('scheduling boom'),
+        ):
+            apply_course_settings.apply(args=[str(batch_job.id)])
+        assert batch_job.logs.filter(level=CourseRerunLog.Level.ERR).exists()

@@ -46,8 +46,10 @@ REST_FRAMEWORK = {
 }
 
 # Celery — run tasks synchronously so no broker is needed during tests.
+# The actual app-level configuration is applied in conftest.py because
+# Django settings are not automatically read by Celery without config_from_object.
 CELERY_TASK_ALWAYS_EAGER = True
-CELERY_TASK_EAGER_PROPAGATES = True
+CELERY_TASK_EAGER_PROPAGATES = False
 
 LOCALE_PATHS = [
     root('openedx_bulk_rerun_ext', 'conf', 'locale'),

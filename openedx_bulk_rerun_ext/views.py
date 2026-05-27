@@ -8,7 +8,7 @@ from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
-from .models import BulkRerunBatch, CourseRerunJob
+from .models import BulkRerunBatch, CourseRerunJob, CourseRerunSettings, CourseRerunTeamMember
 from .serializers import (
     BulkRerunBatchCreateSerializer,
     BulkRerunBatchSerializer,
@@ -296,6 +296,14 @@ class BulkRerunBatchListCreateView(APIView):
                 created_by=request.user,
             )
             jobs.append(job)
+
+        # Create the settings row from the nested payload.
+        settings_data = data['settings']
+        CourseRerunSettings.objects.create(batch=batch, **settings_data)
+
+        # Create one team member row per CAR entry (may be empty list).
+        for member in data.get('team_members', []):
+            CourseRerunTeamMember.objects.create(batch=batch, **member)
 
         from .tasks import dispatch_batch_rerun  # pylint: disable=import-outside-toplevel
         dispatch_batch_rerun.delay(str(batch.id))

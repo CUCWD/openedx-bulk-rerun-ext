@@ -1,5 +1,6 @@
 """
-Tests for CourseRerunJob, BulkRerunBatch, and CourseRerunLog models.
+Tests for CourseRerunJob, BulkRerunBatch, CourseRerunLog, CourseRerunSettings,
+and CourseRerunTeamMember models.
 """
 # pylint: disable=redefined-outer-name
 import uuid
@@ -7,8 +8,15 @@ import uuid
 import pytest
 from django.contrib.auth import get_user_model
 from django.db import IntegrityError
+from django.utils import timezone
 
-from openedx_bulk_rerun_ext.models import BulkRerunBatch, CourseRerunJob, CourseRerunLog
+from openedx_bulk_rerun_ext.models import (
+    BulkRerunBatch,
+    CourseRerunJob,
+    CourseRerunLog,
+    CourseRerunSettings,
+    CourseRerunTeamMember,
+)
 
 User = get_user_model()
 pytestmark = pytest.mark.django_db
@@ -311,3 +319,138 @@ class TestCourseRerunLog:
         CourseRerunLog.objects.create(job=batch_job, message='line 3')
         newer = list(batch_job.logs.filter(id__gt=l1.id).values_list('message', flat=True))
         assert newer == ['line 2', 'line 3']
+
+
+# ── Phase 3: CourseRerunJob.settings_applied ──────────────────────────────────
+
+class TestCourseRerunJobSettingsApplied:
+    """settings_applied defaults to False and can be flipped to True."""
+
+    def test_settings_applied_defaults_to_false(self, job):
+        assert job.settings_applied is False
+
+    def test_settings_applied_can_be_set(self, job):
+        job.settings_applied = True
+        job.save(update_fields=['settings_applied'])
+        job.refresh_from_db()
+        assert job.settings_applied is True
+
+
+# ── Phase 3: CourseRerunSettings ──────────────────────────────────────────────
+
+def _make_settings(batch):
+    """Create a CourseRerunSettings row with valid scheduling dates for the given batch."""
+    now = timezone.now()
+    return CourseRerunSettings.objects.create(
+        batch=batch,
+        course_start=now,
+        course_end=now.replace(year=now.year + 1),
+        enrollment_start=now,
+        enrollment_end=now.replace(year=now.year + 1),
+    )
+
+
+class TestCourseRerunSettingsDefaults:
+    """Newly created settings rows have the expected field defaults."""
+
+    def test_pacing_defaults_to_instructor(self, batch):
+        s = _make_settings(batch)
+        assert s.pacing == CourseRerunSettings.Pacing.INSTRUCTOR
+
+    def test_course_mode_defaults_to_honor(self, batch):
+        s = _make_settings(batch)
+        assert s.course_mode == CourseRerunSettings.CourseMode.HONOR
+
+    def test_cert_display_defaults_to_early_no_info(self, batch):
+        s = _make_settings(batch)
+        assert s.cert_display == CourseRerunSettings.CertDisplay.EARLY_NO_INFO
+
+    def test_create_cert_defaults_to_true(self, batch):
+        s = _make_settings(batch)
+        assert s.create_cert is True
+
+    def test_student_gen_cert_defaults_to_true(self, batch):
+        s = _make_settings(batch)
+        assert s.student_gen_cert is True
+
+    def test_cert_on_dashboard_defaults_to_true(self, batch):
+        s = _make_settings(batch)
+        assert s.cert_on_dashboard is True
+
+    def test_gating_mode_defaults_to_disabled(self, batch):
+        s = _make_settings(batch)
+        assert s.gating_mode == CourseRerunSettings.GatingMode.DISABLED
+
+    def test_gating_template_id_defaults_to_empty(self, batch):
+        s = _make_settings(batch)
+        assert s.gating_template_id == ''
+
+    def test_remove_provisioner_after_defaults_to_true(self, batch):
+        s = _make_settings(batch)
+        assert s.remove_provisioner_after is True
+
+    def test_id_is_uuid(self, batch):
+        s = _make_settings(batch)
+        assert isinstance(s.id, uuid.UUID)
+
+
+class TestCourseRerunSettingsRelationship:
+    """CourseRerunSettings is accessible via the OneToOne reverse accessor."""
+
+    def test_batch_settings_accessor_returns_row(self, batch):
+        s = _make_settings(batch)
+        assert batch.settings.id == s.id
+
+    def test_settings_cascade_deleted_with_batch(self, batch):
+        s = _make_settings(batch)
+        settings_id = s.id
+        batch.delete()
+        assert not CourseRerunSettings.objects.filter(id=settings_id).exists()
+
+    def test_second_settings_row_raises_integrity_error(self, batch):
+        _make_settings(batch)
+        with pytest.raises(Exception):
+            _make_settings(batch)
+
+
+# ── Phase 3: CourseRerunTeamMember ────────────────────────────────────────────
+
+class TestCourseRerunTeamMemberDefaults:
+    """Newly created team member rows have the expected field defaults."""
+
+    def test_studio_role_defaults_to_admin(self, batch):
+        m = CourseRerunTeamMember.objects.create(batch=batch, email='a@example.com')
+        assert m.studio_role == CourseRerunTeamMember.StudioRole.ADMIN
+
+    def test_discussion_role_defaults_to_discussion_admin(self, batch):
+        m = CourseRerunTeamMember.objects.create(batch=batch, email='a@example.com')
+        assert m.discussion_role == CourseRerunTeamMember.DiscussionRole.DISCUSSION_ADMIN
+
+
+class TestCourseRerunTeamMemberConstraints:
+    """unique_together and ordering are enforced at the DB level."""
+
+    def test_unique_together_prevents_duplicate_email_in_same_batch(self, batch):
+        CourseRerunTeamMember.objects.create(batch=batch, email='dup@example.com')
+        with pytest.raises(IntegrityError):
+            CourseRerunTeamMember.objects.create(batch=batch, email='dup@example.com')
+
+    def test_same_email_allowed_in_different_batches(self, user, batch):
+        second_batch = BulkRerunBatch.objects.create(
+            created_by=user, mode=BulkRerunBatch.Mode.INDIVIDUAL, target_run='2027_2028'
+        )
+        CourseRerunTeamMember.objects.create(batch=batch, email='shared@example.com')
+        CourseRerunTeamMember.objects.create(batch=second_batch, email='shared@example.com')
+        assert CourseRerunTeamMember.objects.filter(email='shared@example.com').count() == 2
+
+    def test_ordering_is_by_email(self, batch):
+        CourseRerunTeamMember.objects.create(batch=batch, email='zzz@example.com')
+        CourseRerunTeamMember.objects.create(batch=batch, email='aaa@example.com')
+        emails = list(batch.team_members.values_list('email', flat=True))
+        assert emails == ['aaa@example.com', 'zzz@example.com']
+
+    def test_cascade_deleted_with_batch(self, batch):
+        CourseRerunTeamMember.objects.create(batch=batch, email='x@example.com')
+        batch_id = batch.id
+        batch.delete()
+        assert CourseRerunTeamMember.objects.filter(batch_id=batch_id).count() == 0

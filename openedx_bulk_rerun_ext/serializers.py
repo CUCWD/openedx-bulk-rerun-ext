@@ -5,7 +5,7 @@ from opaque_keys import InvalidKeyError
 from opaque_keys.edx.keys import CourseKey
 from rest_framework import serializers
 
-from .models import BulkRerunBatch, CourseRerunJob, CourseRerunLog
+from .models import BulkRerunBatch, CourseRerunJob, CourseRerunLog, CourseRerunSettings, CourseRerunTeamMember
 
 # ── Phase 1 serializers ───────────────────────────────────────────────────────
 
@@ -48,6 +48,47 @@ class CourseRerunJobSerializer(serializers.ModelSerializer):
 
 # ── Phase 2 serializers ───────────────────────────────────────────────────────
 
+# ── Phase 3 serializers (defined before BulkRerunBatchCreateSerializer so they
+#    can be used as nested fields) ────────────────────────────────────────────
+
+
+class CourseRerunSettingsSerializer(serializers.ModelSerializer):
+    """Write serializer for CourseRerunSettings; nested inside BulkRerunBatchCreateSerializer."""
+
+    class Meta:
+        """Expose all operator-configurable settings fields."""
+
+        model = CourseRerunSettings
+        fields = [
+            'course_start', 'course_end',
+            'enrollment_start', 'enrollment_end',
+            'pacing',
+            'course_mode', 'cert_display', 'create_cert', 'student_gen_cert', 'cert_on_dashboard',
+            'gating_mode', 'gating_template_id',
+            'remove_provisioner_after',
+        ]
+
+    def validate(self, attrs):
+        """Enforce scheduling window constraints: start < end, enrollment within course window."""
+        if attrs['course_start'] >= attrs['course_end']:
+            raise serializers.ValidationError('course_start must be before course_end.')
+        if attrs['enrollment_start'] > attrs['course_start']:
+            raise serializers.ValidationError('enrollment_start must be on or before course_start.')
+        if attrs['enrollment_end'] > attrs['course_end']:
+            raise serializers.ValidationError('enrollment_end must be on or before course_end.')
+        return attrs
+
+
+class CourseRerunTeamMemberSerializer(serializers.ModelSerializer):
+    """Write serializer for a single CAR team member entry."""
+
+    class Meta:
+        """Expose the three fields submitted by the UI Team & Access tab."""
+
+        model = CourseRerunTeamMember
+        fields = ['email', 'studio_role', 'discussion_role']
+
+
 class _CourseEntrySerializer(serializers.Serializer):  # pylint: disable=abstract-method
     """Validates a single course entry within a batch create request."""
 
@@ -71,6 +112,8 @@ class BulkRerunBatchCreateSerializer(serializers.Serializer):  # pylint: disable
         min_length=1,
         max_length=200,
     )
+    settings = CourseRerunSettingsSerializer()
+    team_members = CourseRerunTeamMemberSerializer(many=True, default=list)
 
     def validate(self, attrs):
         """Enforce key validity, source≠target, and no duplicate targets within the batch."""
@@ -106,7 +149,7 @@ class CourseRerunJobBriefSerializer(serializers.ModelSerializer):
 
         model = CourseRerunJob
         fields = [
-            'id', 'position', 'status',
+            'id', 'position', 'status', 'settings_applied',
             'source_course_key', 'target_course_key',
             'started_at', 'completed_at', 'elapsed_seconds',
             'error_message',
@@ -126,6 +169,7 @@ class BulkRerunBatchSerializer(serializers.ModelSerializer):
     total_jobs = serializers.IntegerField(read_only=True)
     done_jobs = serializers.IntegerField(read_only=True)
     failed_jobs = serializers.IntegerField(read_only=True)
+    settings_applied_count = serializers.SerializerMethodField()
 
     class Meta:
         """Expose all batch-level fields plus the nested jobs list."""
@@ -133,10 +177,14 @@ class BulkRerunBatchSerializer(serializers.ModelSerializer):
         model = BulkRerunBatch
         fields = [
             'id', 'status', 'mode', 'is_dry_run', 'target_run', 'prog_id',
-            'total_jobs', 'done_jobs', 'failed_jobs',
+            'total_jobs', 'done_jobs', 'failed_jobs', 'settings_applied_count',
             'created_at', 'completed_at',
             'jobs',
         ]
+
+    def get_settings_applied_count(self, obj):
+        """Return the number of jobs in this batch that have had settings applied."""
+        return obj.jobs.filter(settings_applied=True).count()
 
 
 class CourseRerunLogSerializer(serializers.ModelSerializer):
