@@ -161,10 +161,124 @@ class CourseRerunJob(models.Model):
             models.Index(fields=['target_course_key']),
         ]
 
+    settings_applied = models.BooleanField(default=False)
+
     @property
     def is_terminal(self):
         """Return True once the job has reached a final state and must not be restarted."""
         return self.status in (self.Status.SUCCEEDED, self.Status.FAILED)
+
+
+class CourseRerunSettings(models.Model):
+    """
+    Operator-configured settings applied to every course in a batch after the rerun succeeds.
+
+    Covers scheduling dates, course mode, certificate behaviour, lesson gating, and
+    provisioner cleanup.  One row per BulkRerunBatch; accessed as batch.settings.
+
+    .. no_pii: Contains course configuration metadata only; no personal data.
+    """
+
+    class Pacing(models.TextChoices):
+        """Pacing modes supported by the platform."""
+
+        INSTRUCTOR = 'instructor', 'Instructor-paced'
+        SELF = 'self', 'Self-paced'
+
+    class CourseMode(models.TextChoices):
+        """Enrolment modes relevant to bulk rerun provisioning."""
+
+        HONOR = 'honor', 'Honor'
+        AUDIT = 'audit', 'Audit'
+        VERIFIED = 'verified', 'Verified'
+
+    class CertDisplay(models.TextChoices):
+        """Certificate display behaviour options."""
+
+        EARLY_NO_INFO = 'early_no_info', 'Early (no info)'
+        EARLY_WITH_INFO = 'early_with_info', 'Early (with info)'
+        END = 'end', 'End of course'
+
+    class GatingMode(models.TextChoices):
+        """Lesson gating strategies supported by Phase 3."""
+
+        DISABLED = 'disabled', 'Disabled'
+        COPY = 'copy', 'Copy from source'
+        TEMPLATE = 'template', 'Apply template'
+        CUSTOM = 'custom', 'Custom (not implemented)'
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    batch = models.OneToOneField(
+        BulkRerunBatch,
+        on_delete=models.CASCADE,
+        related_name='settings',
+    )
+
+    # Scheduling
+    course_start = models.DateTimeField()
+    course_end = models.DateTimeField()
+    enrollment_start = models.DateTimeField()
+    enrollment_end = models.DateTimeField()
+    pacing = models.CharField(max_length=16, choices=Pacing.choices, default=Pacing.INSTRUCTOR)
+
+    # Certificates
+    course_mode = models.CharField(max_length=16, choices=CourseMode.choices, default=CourseMode.HONOR)
+    cert_display = models.CharField(max_length=32, choices=CertDisplay.choices, default=CertDisplay.EARLY_NO_INFO)
+    create_cert = models.BooleanField(default=True)
+    student_gen_cert = models.BooleanField(default=True)
+    cert_on_dashboard = models.BooleanField(default=True)
+
+    # Lesson gating
+    gating_mode = models.CharField(max_length=16, choices=GatingMode.choices, default=GatingMode.DISABLED)
+    gating_template_id = models.CharField(max_length=128, blank=True, default='')
+
+    # Provisioner cleanup
+    remove_provisioner_after = models.BooleanField(default=True)
+
+
+class CourseRerunTeamMember(models.Model):
+    """
+    A single CAR (Course Assignment Roster) entry for a bulk rerun batch.
+
+    One row per team member listed in the Step 2 Team & Access tab of the UI.
+    All members are added to every course created within the batch.
+
+    .. no_pii: Email is operational metadata used solely for user lookup during
+        course provisioning; it is not displayed or processed beyond that lookup.
+    """
+
+    class StudioRole(models.TextChoices):
+        """Studio course team roles."""
+
+        ADMIN = 'admin', 'Admin'
+        STAFF = 'staff', 'Staff'
+        DATA_RESEARCHER = 'data_researcher', 'Data Researcher'
+
+    class DiscussionRole(models.TextChoices):
+        """Discussion forum roles."""
+
+        DISCUSSION_ADMIN = 'discussion_admin', 'Discussion Admin'
+        MODERATOR = 'moderator', 'Moderator'
+        NONE = 'none', 'None'
+
+    batch = models.ForeignKey(
+        BulkRerunBatch,
+        on_delete=models.CASCADE,
+        related_name='team_members',
+    )
+    email = models.EmailField()
+    studio_role = models.CharField(max_length=32, choices=StudioRole.choices, default=StudioRole.ADMIN)
+    discussion_role = models.CharField(
+        max_length=32,
+        choices=DiscussionRole.choices,
+        default=DiscussionRole.DISCUSSION_ADMIN,
+    )
+
+    class Meta:
+        """Ordering and uniqueness constraints for team member entries."""
+
+        ordering = ['email']
+        unique_together = [('batch', 'email')]
 
 
 class CourseRerunLog(models.Model):

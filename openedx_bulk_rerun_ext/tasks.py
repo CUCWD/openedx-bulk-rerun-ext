@@ -33,6 +33,20 @@ def _check_batch_completion(batch_id):
     batch.save(update_fields=['status', 'completed_at'])
 
 
+def _finalize_job(job, success, error=''):
+    """Set terminal status on a job and roll up the parent batch if one exists."""
+    from .models import CourseRerunJob  # pylint: disable=import-outside-toplevel
+    job.status = CourseRerunJob.Status.SUCCEEDED if success else CourseRerunJob.Status.FAILED
+    job.completed_at = timezone.now()
+    update_fields = ['status', 'completed_at']
+    if not success:
+        job.error_message = error
+        update_fields.append('error_message')
+    job.save(update_fields=update_fields)
+    if job.batch_id:
+        _check_batch_completion(str(job.batch_id))
+
+
 @shared_task
 def dispatch_batch_rerun(batch_id):
     """
@@ -110,7 +124,7 @@ def run_course_rerun(self, job_id):
              f'{"would create course shell." if is_dry_run else "creating from source template..."}')
 
         if is_dry_run:
-            _log(job.id, 'ok', '[DRY-RUN] ✓ Dry-run complete. No course was created.')
+            _log(job.id, 'ok', '[DRY-RUN] Course shell skipped.')
         else:
             # Create the CourseRerunState row so rerun_course can update it to
             # succeeded/failed. allow_not_found=True makes this safe on retries.
@@ -135,16 +149,11 @@ def run_course_rerun(self, job_id):
                 raise RuntimeError(f"rerun_course did not succeed: {result.result!r}")
 
             _log(job.id, 'ok', 'Course shell created. Target CourseKey registered.')
-            _log(job.id, 'ok', 'certificates.setup(): changing course mode Audit → Honor...')
-            _log(job.id, 'ok', 'CourseMode updated to Honor.')
-            _log(job.id, 'ok', '✓ Course creation complete.')
 
-        job.status = CourseRerunJob.Status.SUCCEEDED
-        job.completed_at = timezone.now()
-        job.save(update_fields=['status', 'completed_at'])
-
-        if job.batch_id:
-            _check_batch_completion(str(job.batch_id))
+        # Chain to apply_course_settings regardless of dry-run; that task
+        # applies (or simulates) scheduling, certs, team access, and gating,
+        # then sets job.status = succeeded when done.
+        apply_course_settings.apply_async(args=[str(job.id)])
 
     except Exception as exc:  # pylint: disable=broad-exception-caught
         # Check retry budget BEFORE calling self.retry() to avoid the
@@ -154,11 +163,87 @@ def run_course_rerun(self, job_id):
         # never fires and the job stays stuck in "running".
         if self.request.retries >= self.max_retries:
             _log(job.id, 'err', f'Course creation failed: {exc}')
-            job.status = CourseRerunJob.Status.FAILED
-            job.completed_at = timezone.now()
-            job.error_message = str(exc)
-            job.save(update_fields=['status', 'completed_at', 'error_message'])
-            if job.batch_id:
-                _check_batch_completion(str(job.batch_id))
+            _finalize_job(job, success=False, error=str(exc))
+        else:
+            raise self.retry(exc=exc)
+
+
+@shared_task(bind=True, max_retries=2, default_retry_delay=15)
+def apply_course_settings(self, job_id):
+    """
+    Apply operator-configured settings to a newly created course.
+
+    Called after run_course_rerun succeeds.  Applies scheduling dates, course
+    mode, certificates, team access, and lesson gating in sequence.  Each
+    category is handled by a dedicated applicator in applicators.py.
+
+    If the job has no batch or the batch has no settings row, the job is
+    finalized immediately with status=succeeded.  Dry-run batches log what
+    would be applied but skip all platform calls.
+
+    Retries up to 2 times with a 15-second delay before marking the job failed.
+    """
+    from .models import CourseRerunJob  # pylint: disable=import-outside-toplevel
+
+    try:
+        job = CourseRerunJob.objects.get(id=job_id)
+    except CourseRerunJob.DoesNotExist:
+        return
+
+    if job.is_terminal:
+        return
+
+    batch = job.batch
+    if batch is None or not hasattr(batch, 'settings'):
+        if batch is not None and batch.is_dry_run:
+            _log(job.id, 'ok', '[DRY-RUN] ✓ Dry-run complete. No changes were made.')
+        else:
+            _log(job.id, 'ok', '✓ Course creation complete.')
+        _finalize_job(job, success=True)
+        return
+
+    s = batch.settings
+    is_dry_run = batch.is_dry_run
+
+    try:
+        # pylint: disable=import-outside-toplevel
+        from opaque_keys.edx.keys import CourseKey
+
+        from .applicators import (
+            apply_certificates,
+            apply_gating,
+            apply_scheduling,
+            apply_team_access,
+            remove_provisioner,
+        )
+
+        course_key = CourseKey.from_string(job.target_course_key)
+
+        if is_dry_run:
+            _log(job.id, 'info', '[DRY-RUN] certificates.setup(): changing course mode Audit → Honor...')
+            _log(job.id, 'ok', '[DRY-RUN] CourseMode updated to Honor.')
+            _log(job.id, 'info', '[DRY-RUN] certificates.activate(): creating certificate...')
+            _log(job.id, 'ok', '[DRY-RUN] Certificate activated.')
+            _log(job.id, 'info', '[DRY-RUN] access.assign_team(): adding team members from CAR...')
+            _log(job.id, 'ok', '[DRY-RUN] Team members assigned.')
+            _log(job.id, 'ok', '[DRY-RUN] ✓ Dry-run complete. No changes were made.')
+        else:
+            apply_scheduling(job, course_key, s)
+            apply_certificates(job, course_key, s)
+            apply_team_access(job, course_key, s, batch.team_members.all(), job.created_by)
+            if s.gating_mode != 'disabled':
+                apply_gating(job, course_key, s)
+            if s.remove_provisioner_after:
+                remove_provisioner(job, course_key, job.created_by)
+            _log(job.id, 'ok', '✓ Course creation complete.')
+
+        job.settings_applied = True
+        job.save(update_fields=['settings_applied'])
+        _finalize_job(job, success=True)
+
+    except Exception as exc:  # pylint: disable=broad-exception-caught
+        _log(job.id, 'err', f'Settings application failed: {exc}')
+        if self.request.retries >= self.max_retries:
+            _finalize_job(job, success=False, error=str(exc))
         else:
             raise self.retry(exc=exc)
