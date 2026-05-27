@@ -32,7 +32,7 @@ INSTALLED_APPS = (
     'django.contrib.contenttypes',
     'django.contrib.messages',
     'django.contrib.sessions',
-    'openedx_bulk_rerun_ext',
+    'openedx_bulk_rerun_ext.apps.OpenedxBulkRerunExtConfig',
 )
 
 LOCALE_PATHS = [
@@ -56,6 +56,7 @@ TEMPLATES = [{
         'context_processors': [
             'django.contrib.auth.context_processors.auth',  # this is required for admin
             'django.contrib.messages.context_processors.messages',  # this is required for admin
+            'django.template.context_processors.request', # required to use the admin navigation sidebar.
         ],
     },
 }]
