@@ -139,10 +139,21 @@ class BulkRerunBatchCreateSerializer(serializers.Serializer):  # pylint: disable
         return attrs
 
 
+class CourseRerunLogSerializer(serializers.ModelSerializer):
+    """Read serializer for individual log lines."""
+
+    class Meta:
+        """Expose all log line fields."""
+
+        model = CourseRerunLog
+        fields = ['id', 'level', 'message', 'created_at']
+
+
 class CourseRerunJobBriefSerializer(serializers.ModelSerializer):
     """Compact job summary nested inside a batch detail response."""
 
     elapsed_seconds = serializers.SerializerMethodField()
+    logs = CourseRerunLogSerializer(many=True, read_only=True)
 
     class Meta:
         """Expose timing and status fields relevant to the Track Progress UI."""
@@ -153,6 +164,7 @@ class CourseRerunJobBriefSerializer(serializers.ModelSerializer):
             'source_course_key', 'target_course_key',
             'started_at', 'completed_at', 'elapsed_seconds',
             'error_message',
+            'logs',
         ]
 
     def get_elapsed_seconds(self, obj):
@@ -185,13 +197,3 @@ class BulkRerunBatchSerializer(serializers.ModelSerializer):
     def get_settings_applied_count(self, obj):
         """Return the number of jobs in this batch that have had settings applied."""
         return obj.jobs.filter(settings_applied=True).count()
-
-
-class CourseRerunLogSerializer(serializers.ModelSerializer):
-    """Read serializer for individual log lines."""
-
-    class Meta:
-        """Expose all log line fields."""
-
-        model = CourseRerunLog
-        fields = ['id', 'level', 'message', 'created_at']

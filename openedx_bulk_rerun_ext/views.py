@@ -65,10 +65,14 @@ class ValidateCourseKeysView(APIView):
         # already succeeded for any of the requested target keys.
         # A succeeded job means the course already exists as a result of a
         # previous rerun, so the key is considered "existing" here too.
+        # Dry-run jobs are excluded: they write DB rows but never create real
+        # courses, so their target keys must not be flagged as "existing".
         existing = set(
             CourseRerunJob.objects.filter(
                 target_course_key__in=keys,
                 status__in=_ACTIVE_STATUSES,
+            ).exclude(
+                batch__is_dry_run=True,
             ).values_list('target_course_key', flat=True)
         )
 
@@ -264,11 +268,15 @@ class BulkRerunBatchListCreateView(APIView):
         data = serializer.validated_data
 
         # Reject any target key that already has an active or succeeded job.
+        # Dry-run jobs are excluded — they write DB rows but never create real
+        # courses, so their target keys must not block a subsequent real submission.
         target_keys = [c['target_course_key'] for c in data['courses']]
         blocked = set(
             CourseRerunJob.objects.filter(
                 target_course_key__in=target_keys,
                 status__in=_ACTIVE_STATUSES,
+            ).exclude(
+                batch__is_dry_run=True,
             ).values_list('target_course_key', flat=True)
         )
         if blocked:
@@ -276,6 +284,13 @@ class BulkRerunBatchListCreateView(APIView):
                 {'error': 'Active jobs already exist for these target keys', 'keys': sorted(blocked)},
                 status=status.HTTP_400_BAD_REQUEST,
             )
+
+        # Remove any dry-run job rows for these target keys so they do not
+        # interfere with the real job rows created below.
+        CourseRerunJob.objects.filter(
+            target_course_key__in=target_keys,
+            batch__is_dry_run=True,
+        ).delete()
 
         batch = BulkRerunBatch.objects.create(
             created_by=request.user,
@@ -340,7 +355,7 @@ class BulkRerunBatchDetailView(APIView):
     def get(self, request, batch_id):
         """Return batch status and the nested job list; 404 if not owned by the caller."""
         try:
-            batch = BulkRerunBatch.objects.get(id=batch_id)
+            batch = BulkRerunBatch.objects.prefetch_related('jobs__logs').get(id=batch_id)
         except BulkRerunBatch.DoesNotExist:
             return Response(status=status.HTTP_404_NOT_FOUND)
 

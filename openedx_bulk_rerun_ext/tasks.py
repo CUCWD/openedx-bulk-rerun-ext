@@ -99,7 +99,7 @@ def run_course_rerun(self, job_id):
     is_dry_run = job.batch.is_dry_run if job.batch_id else False
     dry_prefix = '[DRY-RUN] ' if is_dry_run else ''
 
-    _log(job.id, 'info', 'ProvisioningJob created.')
+    _log(job.id, 'info', f'ProvisioningJob {job.id} created for batch {job.batch_id}.')
 
     job.status = CourseRerunJob.Status.RUNNING
     # Only record started_at on the first attempt; retries preserve the original time.
@@ -126,6 +126,19 @@ def run_course_rerun(self, job_id):
         if is_dry_run:
             _log(job.id, 'ok', '[DRY-RUN] Course shell skipped.')
         else:
+            # Remove any stale organizations_organizationcourse rows for the
+            # target key before calling rerun_course. The platform's clone_instance
+            # helper does a blind INSERT into that table; if a row already exists
+            # (e.g. from a previous failed attempt or a manually created course)
+            # it raises IntegrityError and aborts the entire rerun.
+            from organizations.models import OrganizationCourse  # pylint: disable=import-outside-toplevel
+            deleted_count, _ = OrganizationCourse.objects.filter(
+                course_id=str(target_key)
+            ).delete()
+            if deleted_count:
+                _log(job.id, 'info',
+                     f'Removed {deleted_count} stale org-course association(s) for {target_key}.')
+
             # Create the CourseRerunState row so rerun_course can update it to
             # succeeded/failed. allow_not_found=True makes this safe on retries.
             CourseRerunState.objects.initiated(
@@ -156,6 +169,18 @@ def run_course_rerun(self, job_id):
         apply_course_settings.apply_async(args=[str(job.id)])
 
     except Exception as exc:  # pylint: disable=broad-exception-caught
+        from django.db.utils import IntegrityError  # pylint: disable=import-outside-toplevel
+        # A duplicate-entry IntegrityError for the target course key means the
+        # course (or its org association) was already created — e.g. by a
+        # previous retry that partially succeeded or by a concurrent job.
+        # Treat this as a non-fatal condition: skip course creation and proceed
+        # directly to settings application.
+        if isinstance(exc, IntegrityError) and job.target_course_key in str(exc):
+            _log(job.id, 'warn',
+                 f'Target course already exists ({job.target_course_key}) — '
+                 'skipping creation, proceeding to settings.')
+            apply_course_settings.apply_async(args=[str(job.id)])
+            return
         # Check retry budget BEFORE calling self.retry() to avoid the
         # MaxRetriesExceededError trap: when retries are exhausted,
         # self.retry(exc=exc) re-raises the original exc (not

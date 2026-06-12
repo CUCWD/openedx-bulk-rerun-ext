@@ -148,7 +148,7 @@ class CourseRerunJob(models.Model):
         default=JobType.INDIVIDUAL,
     )
     source_course_key = models.CharField(max_length=255)
-    target_course_key = models.CharField(max_length=255, unique=True)
+    target_course_key = models.CharField(max_length=255)
     celery_task_id = models.CharField(max_length=255, null=True, blank=True)
     error_message = models.TextField(blank=True, default='')
 
