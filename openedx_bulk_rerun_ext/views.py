@@ -1,6 +1,11 @@
 """
 Views for openedx_bulk_rerun_ext.
 """
+import logging
+import threading
+
+from django.db import close_old_connections, transaction
+from django.db.models import Prefetch
 from opaque_keys import InvalidKeyError
 from opaque_keys.edx.keys import CourseKey
 from rest_framework import status
@@ -8,10 +13,11 @@ from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
-from .models import BulkRerunBatch, CourseRerunJob, CourseRerunSettings, CourseRerunTeamMember
+from .models import BulkRerunBatch, CourseRerunJob, CourseRerunLog, CourseRerunSettings, CourseRerunTeamMember
 from .serializers import (
     BulkRerunBatchCreateSerializer,
     BulkRerunBatchSerializer,
+    BulkRerunBatchSummarySerializer,
     CourseRerunJobSerializer,
     CourseRerunLogSerializer,
     CreateCourseRerunJobSerializer,
@@ -24,6 +30,16 @@ _ACTIVE_STATUSES = [
     CourseRerunJob.Status.PENDING,
     CourseRerunJob.Status.RUNNING,
     CourseRerunJob.Status.SUCCEEDED,
+]
+
+# For the validate endpoint's DB pass we only treat PENDING/RUNNING as a
+# reservation — the key is actively being written to.  SUCCEEDED is intentionally
+# excluded: the modulestore check (Pass 2) is the authoritative source of truth
+# for whether the course still exists, so a SUCCEEDED row for a since-deleted
+# course must not be flagged as a conflict.
+_RESERVED_STATUSES = [
+    CourseRerunJob.Status.PENDING,
+    CourseRerunJob.Status.RUNNING,
 ]
 
 
@@ -61,16 +77,16 @@ class ValidateCourseKeysView(APIView):
                     status=status.HTTP_400_BAD_REQUEST,
                 )
 
-        # Pass 1: check our own DB for jobs that are pending, running, or
-        # already succeeded for any of the requested target keys.
-        # A succeeded job means the course already exists as a result of a
-        # previous rerun, so the key is considered "existing" here too.
-        # Dry-run jobs are excluded: they write DB rows but never create real
-        # courses, so their target keys must not be flagged as "existing".
+        # Pass 1: check our own DB for jobs that are actively reserving a target
+        # key (PENDING or RUNNING).  SUCCEEDED is excluded here because the
+        # modulestore check in Pass 2 is the authoritative source of truth — a
+        # SUCCEEDED row for a since-deleted course must not be flagged as a
+        # conflict.  Dry-run jobs are excluded: they write DB rows but never
+        # create real courses, so their target keys must not be flagged either.
         existing = set(
             CourseRerunJob.objects.filter(
                 target_course_key__in=keys,
-                status__in=_ACTIVE_STATUSES,
+                status__in=_RESERVED_STATUSES,
             ).exclude(
                 batch__is_dry_run=True,
             ).values_list('target_course_key', flat=True)
@@ -252,14 +268,31 @@ class CourseRerunJobDetail(APIView):
 
 class BulkRerunBatchListCreateView(APIView):
     """
-    Submit a full bulk rerun batch from the UI.
+    List or create bulk rerun batches.
 
-    POST /api/bulk-rerun/batches/ — creates one BulkRerunBatch and N
-    CourseRerunJob rows, then dispatches the fan-out Celery task.
-    Returns 202 Accepted with the batch ID and initial job list.
+    GET  /api/bulk-rerun/batches/           — lists the caller's batches.
+         ?status=running,pending             — optional comma-separated filter.
+         Returns the lightweight summary serializer (no nested job logs) so the
+         Tracking Progress page can recover in-flight batches on page load or
+         cross-device without relying on client-side localStorage.
+
+    POST /api/bulk-rerun/batches/           — creates one BulkRerunBatch and N
+         CourseRerunJob rows, then dispatches the fan-out Celery task.
+         Accepts an optional ``config_snapshot`` field that is stored in
+         ``BulkRerunBatch.config_json`` for later recovery via the GET endpoint.
+         Returns 202 Accepted with the batch ID and initial job list.
     """
 
     permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        """List the caller's batches; ?status= filters by comma-separated status values."""
+        qs = BulkRerunBatch.objects.filter(created_by=request.user)
+        status_param = request.query_params.get('status')
+        if status_param:
+            qs = qs.filter(status__in=[s.strip() for s in status_param.split(',')])
+        qs = qs.order_by('-created_at')[:100]
+        return Response(BulkRerunBatchSummarySerializer(qs, many=True).data)
 
     def post(self, request):
         """Validate the batch payload, create all rows, and dispatch the fan-out task."""
@@ -267,18 +300,20 @@ class BulkRerunBatchListCreateView(APIView):
         serializer.is_valid(raise_exception=True)
         data = serializer.validated_data
 
-        # Reject any target key that already has an active or succeeded job.
-        # Dry-run jobs are excluded — they write DB rows but never create real
-        # courses, so their target keys must not block a subsequent real submission.
+        # Reject keys with an in-flight job (PENDING or RUNNING only).
+        # SUCCEEDED is excluded — existing courses are allowed; the task will
+        # skip creation and re-apply settings to the already-present course.
+        # Dry-run jobs are excluded: they write DB rows but never create real courses.
         target_keys = [c['target_course_key'] for c in data['courses']]
         blocked = set(
             CourseRerunJob.objects.filter(
                 target_course_key__in=target_keys,
-                status__in=_ACTIVE_STATUSES,
+                status__in=_RESERVED_STATUSES,
             ).exclude(
                 batch__is_dry_run=True,
             ).values_list('target_course_key', flat=True)
         )
+
         if blocked:
             return Response(
                 {'error': 'Active jobs already exist for these target keys', 'keys': sorted(blocked)},
@@ -298,6 +333,7 @@ class BulkRerunBatchListCreateView(APIView):
             is_dry_run=data['is_dry_run'],
             target_run=data['target_run'],
             prog_id=data.get('prog_id', ''),
+            config_json=request.data.get('config_snapshot') or None,
         )
 
         jobs = []
@@ -317,11 +353,46 @@ class BulkRerunBatchListCreateView(APIView):
         CourseRerunSettings.objects.create(batch=batch, **settings_data)
 
         # Create one team member row per CAR entry (may be empty list).
+        # Deduplicate by email — the same person may appear in multiple org
+        # rosters in the wizard; keep the first occurrence of each email.
+        seen_emails: set = set()
         for member in data.get('team_members', []):
+            email = (member.get('email') or '').strip()
+            if not email or email in seen_emails:
+                continue
+            seen_emails.add(email)
             CourseRerunTeamMember.objects.create(batch=batch, **member)
 
-        from .tasks import dispatch_batch_rerun  # pylint: disable=import-outside-toplevel
-        dispatch_batch_rerun.delay(str(batch.id))
+        from .tasks import dispatch_batch_rerun, _dispatch_task  # pylint: disable=import-outside-toplevel
+
+        log = logging.getLogger(__name__)
+        batch_id_str = str(batch.id)
+
+        def _dispatch():
+            # Runs the full task chain in a daemon thread so the 202 response
+            # returns immediately and the UI can poll for real-time progress.
+            # _dispatch_task uses BULK_RERUN_USE_CELERY (default False) to decide
+            # whether to run synchronously here or enqueue to a Celery worker.
+            close_old_connections()
+            try:
+                _dispatch_task(dispatch_batch_rerun, batch_id_str)
+            except Exception:  # pylint: disable=broad-exception-caught
+                log.exception('[BulkRerun] Background dispatch thread failed for batch %s', batch_id_str)
+                from .models import BulkRerunBatch as _Batch  # pylint: disable=import-outside-toplevel
+                try:
+                    _Batch.objects.filter(id=batch_id_str).update(status=_Batch.Status.FAILED)
+                except Exception:  # pylint: disable=broad-exception-caught
+                    pass
+            finally:
+                close_old_connections()
+
+        # transaction.on_commit ensures the thread starts AFTER the current
+        # DB transaction commits, so dispatch_batch_rerun can see the batch
+        # and job rows. Without this, MySQL REPEATABLE READ isolation can
+        # cause the task to get DoesNotExist and silently leave all jobs pending.
+        transaction.on_commit(
+            lambda: threading.Thread(target=_dispatch, daemon=True).start()
+        )
 
         return Response(
             {
@@ -355,7 +426,19 @@ class BulkRerunBatchDetailView(APIView):
     def get(self, request, batch_id):
         """Return batch status and the nested job list; 404 if not owned by the caller."""
         try:
-            batch = BulkRerunBatch.objects.prefetch_related('jobs__logs').get(id=batch_id)
+            # Jobs MUST come back in position order so the UI can match them to
+            # courseItems by index or by target_course_key reliably.
+            # The model's default ordering (-created_at) would return jobs in
+            # reverse creation order, silently assigning wrong logs to wrong courses.
+            # Logs are ordered by created_at via CourseRerunLog.Meta.ordering.
+            batch = BulkRerunBatch.objects.prefetch_related(
+                Prefetch(
+                    'jobs',
+                    queryset=CourseRerunJob.objects.order_by('position').prefetch_related(
+                        Prefetch('logs', queryset=CourseRerunLog.objects.order_by('created_at'))
+                    ),
+                )
+            ).get(id=batch_id)
         except BulkRerunBatch.DoesNotExist:
             return Response(status=status.HTTP_404_NOT_FOUND)
 
@@ -363,6 +446,55 @@ class BulkRerunBatchDetailView(APIView):
             return Response(status=status.HTTP_404_NOT_FOUND)
 
         return Response(BulkRerunBatchSerializer(batch).data)
+
+
+class BulkRerunBatchCancelView(APIView):
+    """
+    Cancel a bulk rerun batch that is stuck or no longer wanted.
+
+    POST /api/bulk-rerun/batches/<uuid:batch_id>/cancel/ — marks all
+    pending/running jobs as failed and sets the batch status to failed.
+    Returns 400 if the batch is already in a terminal state.
+    Returns 404 if the batch does not exist or was not created by the caller.
+    """
+
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request, batch_id):
+        """Cancel a non-terminal batch by marking all active jobs and the batch as failed."""
+        try:
+            batch = BulkRerunBatch.objects.get(id=batch_id)
+        except BulkRerunBatch.DoesNotExist:
+            return Response(status=status.HTTP_404_NOT_FOUND)
+
+        if batch.created_by != request.user:
+            return Response(status=status.HTTP_404_NOT_FOUND)
+
+        terminal = {
+            BulkRerunBatch.Status.SUCCEEDED,
+            BulkRerunBatch.Status.FAILED,
+            BulkRerunBatch.Status.PARTIAL,
+        }
+        if batch.status in terminal:
+            return Response(
+                {'error': 'Batch is already in a terminal state and cannot be cancelled.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        from django.utils import timezone as tz  # pylint: disable=import-outside-toplevel
+        now = tz.now()
+        cancelled = batch.jobs.filter(
+            status__in=[CourseRerunJob.Status.PENDING, CourseRerunJob.Status.RUNNING],
+        ).update(
+            status=CourseRerunJob.Status.FAILED,
+            error_message='Cancelled by user.',
+            completed_at=now,
+        )
+        batch.status = BulkRerunBatch.Status.FAILED
+        batch.completed_at = now
+        batch.save(update_fields=['status', 'completed_at'])
+
+        return Response({'cancelled_jobs': cancelled, 'status': batch.status})
 
 
 class CourseRerunJobLogsView(APIView):

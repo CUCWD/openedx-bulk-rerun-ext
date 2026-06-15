@@ -2,7 +2,23 @@
 Celery tasks for openedx_bulk_rerun_ext.
 """
 from celery import shared_task
+from django.conf import settings as django_settings
 from django.utils import timezone
+
+
+def _dispatch_task(task, *args):
+    """
+    Dispatch a Celery task either to the broker (when BULK_RERUN_USE_CELERY=True)
+    or run it synchronously in the current thread (default).
+
+    Thread mode requires no separate Celery worker and is the default for
+    development.  Set BULK_RERUN_USE_CELERY = True in Django settings to
+    dispatch to a running CMS Celery worker instead.
+    """
+    if getattr(django_settings, 'BULK_RERUN_USE_CELERY', False):
+        task.apply_async(args=list(args))
+    else:
+        task.apply(args=list(args))
 
 
 def _log(job_id, level, message):
@@ -68,10 +84,7 @@ def dispatch_batch_rerun(batch_id):
 
     jobs = batch.jobs.filter(status='pending').order_by('position')
     for job in jobs:
-        run_course_rerun.apply_async(
-            args=[str(job.id)],
-            countdown=job.position * 2,
-        )
+        _dispatch_task(run_course_rerun, str(job.id))
 
 
 @shared_task(bind=True, max_retries=3, default_retry_delay=30)
@@ -118,7 +131,9 @@ def run_course_rerun(self, job_id):
         source_key = CourseKey.from_string(job.source_course_key)
         target_key = CourseKey.from_string(job.target_course_key)
 
-        _log(job.id, 'info', f'{dry_prefix}planner.build_plan(): source key resolved.')
+        _log(job.id, 'info',
+             f'{dry_prefix}planner.build_plan(): source key resolved. '
+             f'source={job.source_course_key} → target={job.target_course_key}')
         _log(job.id, 'info',
              f'{dry_prefix}courses.create_course(): '
              f'{"would create course shell." if is_dry_run else "creating from source template..."}')
@@ -148,6 +163,25 @@ def run_course_rerun(self, job_id):
                 display_name='',
             )
 
+            # Fetch the source course display name and strip template prefixes
+            # ("Demo: ", "DEV: ", "Template: ") so the cloned course has a clean title.
+            # rerun_course expects fields as a JSON string, not a dict.
+            import re    # pylint: disable=import-outside-toplevel
+            import json  # pylint: disable=import-outside-toplevel
+            fields_json = None
+            try:
+                from xmodule.modulestore.django import modulestore as get_store  # pylint: disable=import-outside-toplevel,import-error
+                src_course = get_store().get_course(source_key)
+                if src_course:
+                    raw_name = src_course.display_name or ''
+                    clean_name = re.sub(r'^(Demo|DEV|Template):\s*', '', raw_name, flags=re.IGNORECASE).strip()
+                    if clean_name != raw_name:
+                        fields_json = json.dumps({'display_name': clean_name})
+                        _log(job.id, 'info',
+                             f'Stripped template prefix from display name: "{raw_name}" → "{clean_name}"')
+            except Exception:  # pylint: disable=broad-exception-caught
+                pass
+
             # .apply() runs rerun_course synchronously in the current process.
             # NEVER call result.get() inside a Celery task — Celery raises
             # RuntimeError("Never call result.get() within a task!") to prevent
@@ -156,9 +190,24 @@ def run_course_rerun(self, job_id):
             # "succeeded" is the only value that means the course was cloned.
             result = rerun_course.apply(
                 args=[str(source_key), str(target_key), job.created_by_id],
-                kwargs={'fields': None},
+                kwargs={'fields': fields_json},
             )
             if result.result != 'succeeded':
+                # Before failing, check whether the course already exists in the
+                # modulestore. If it does the user wants to re-apply settings to
+                # an existing course — skip creation and proceed to settings.
+                already_exists = False
+                try:
+                    from xmodule.modulestore.django import modulestore as get_store  # pylint: disable=import-outside-toplevel,import-error
+                    already_exists = get_store().has_course(target_key)
+                except Exception:  # pylint: disable=broad-exception-caught
+                    pass
+                if already_exists:
+                    _log(job.id, 'warn',
+                         f'Target course already exists ({job.target_course_key}) — '
+                         'skipping creation, proceeding to settings.')
+                    _dispatch_task(apply_course_settings, str(job.id))
+                    return
                 raise RuntimeError(f"rerun_course did not succeed: {result.result!r}")
 
             _log(job.id, 'ok', 'Course shell created. Target CourseKey registered.')
@@ -166,7 +215,7 @@ def run_course_rerun(self, job_id):
         # Chain to apply_course_settings regardless of dry-run; that task
         # applies (or simulates) scheduling, certs, team access, and gating,
         # then sets job.status = succeeded when done.
-        apply_course_settings.apply_async(args=[str(job.id)])
+        _dispatch_task(apply_course_settings, str(job.id))
 
     except Exception as exc:  # pylint: disable=broad-exception-caught
         from django.db.utils import IntegrityError  # pylint: disable=import-outside-toplevel
@@ -179,7 +228,7 @@ def run_course_rerun(self, job_id):
             _log(job.id, 'warn',
                  f'Target course already exists ({job.target_course_key}) — '
                  'skipping creation, proceeding to settings.')
-            apply_course_settings.apply_async(args=[str(job.id)])
+            _dispatch_task(apply_course_settings, str(job.id))
             return
         # Check retry budget BEFORE calling self.retry() to avoid the
         # MaxRetriesExceededError trap: when retries are exhausted,
@@ -239,6 +288,7 @@ def apply_course_settings(self, job_id):
             apply_gating,
             apply_scheduling,
             apply_team_access,
+            ensure_org_course_association,
             remove_provisioner,
         )
 
@@ -253,6 +303,7 @@ def apply_course_settings(self, job_id):
             _log(job.id, 'ok', '[DRY-RUN] Team members assigned.')
             _log(job.id, 'ok', '[DRY-RUN] ✓ Dry-run complete. No changes were made.')
         else:
+            ensure_org_course_association(job, course_key)
             apply_scheduling(job, course_key, s)
             apply_certificates(job, course_key, s)
             apply_team_access(job, course_key, s, batch.team_members.all(), job.created_by)

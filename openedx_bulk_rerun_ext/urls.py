@@ -4,6 +4,7 @@ URLs for openedx_bulk_rerun_ext.
 from django.urls import path
 
 from .views import (
+    BulkRerunBatchCancelView,
     BulkRerunBatchDetailView,
     BulkRerunBatchListCreateView,
     CourseRerunJobDetail,
@@ -22,5 +23,6 @@ urlpatterns = [
     # Phase 2
     path('batches/', BulkRerunBatchListCreateView.as_view(), name='batches-list'),
     path('batches/<uuid:batch_id>/', BulkRerunBatchDetailView.as_view(), name='batches-detail'),
+    path('batches/<uuid:batch_id>/cancel/', BulkRerunBatchCancelView.as_view(), name='batches-cancel'),
     path('jobs/<uuid:job_id>/logs/', CourseRerunJobLogsView.as_view(), name='jobs-logs'),
 ]

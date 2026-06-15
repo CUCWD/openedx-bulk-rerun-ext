@@ -52,6 +52,16 @@ class BulkRerunBatch(models.Model):
         default=Status.PENDING,
         db_index=True,
     )
+    config_json = models.JSONField(
+        null=True,
+        blank=True,
+        default=None,
+        help_text=(
+            'Snapshot of the wizard cfg object (rows, prog, fromMode, etc.) '
+            'stored at submission time so the progress UI can reconstruct '
+            'display context on any device or after a page refresh.'
+        ),
+    )
 
     class Meta:
         """Default ordering for batch listings."""

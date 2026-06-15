@@ -15,6 +15,37 @@ def _log(job_id, level, message):
     CourseRerunLog.objects.create(job_id=job_id, level=level, message=message)
 
 
+def ensure_org_course_association(job, course_key):
+    """
+    Guarantee that an OrganizationCourse row exists for the target course using
+    the target course's own org.
+
+    rerun_course's clone_instance may record the source org rather than the
+    target org, or may leave no association at all when creation is skipped.
+    This applicator runs first in apply_course_settings so downstream steps
+    (certificates, team access) always see a correct org-course link.
+    """
+    try:
+        from organizations.models import Organization, OrganizationCourse  # pylint: disable=import-outside-toplevel
+        target_org = Organization.objects.filter(short_name=course_key.org).first()
+        if target_org:
+            removed, _ = OrganizationCourse.objects.filter(
+                course_id=str(course_key),
+            ).exclude(organization=target_org).delete()
+            if removed:
+                _log(job.id, 'info',
+                     f'Removed {removed} stale org-course row(s) for {course_key}.')
+            _, created = OrganizationCourse.objects.get_or_create(
+                course_id=str(course_key),
+                organization=target_org,
+            )
+            if created:
+                _log(job.id, 'info',
+                     f'Created org-course association: {course_key.org} → {course_key}.')
+    except Exception as exc:  # pylint: disable=broad-exception-caught
+        _log(job.id, 'warn', f'Org-course association check failed (non-fatal): {exc}')
+
+
 def apply_scheduling(job, course_key, settings):
     """
     Apply scheduling dates and pacing to the target course.
@@ -31,9 +62,17 @@ def apply_scheduling(job, course_key, settings):
     try:
         # pylint: disable=import-outside-toplevel
         from openedx.core.djangoapps.models.course_details import CourseDetails
+        existing = CourseDetails.fetch(course_key)
         CourseDetails.update_from_json(
             course_key,
             {
+                # update_from_json unconditionally reads these two keys; pass
+                # existing values so we don't overwrite unrelated course content.
+                # Error: Settings application failed: 'overview'
+                'overview': existing.overview or '',
+                'intro_video': existing.intro_video,
+
+                # Set the new scheduling values from the CAR settings.
                 'start_date': settings.course_start.isoformat(),
                 'end_date': settings.course_end.isoformat(),
                 'enrollment_start': settings.enrollment_start.isoformat(),
@@ -49,16 +88,27 @@ def apply_scheduling(job, course_key, settings):
 
 def apply_certificates(job, course_key, settings):
     """
-    Set the course enrolment mode and activate self-generated certificates.
+    Set the course enrolment mode, activate a certificate configuration, and
+    enable self-generated certificates.
 
     Steps:
       1. Update or create the CourseMode row for the target course.
-      2. Enable self-generated certificates via the certificates API.
+         course_modes in the Studio certificate UI is read at runtime from
+         CourseMode.modes_for_course(), so this row is what ties settings.course_mode
+         to the certificate context — there is no mode field in the XBlock cert schema.
+      2. Ensure a certificate configuration exists on the course XBlock.
+         clone_course copies the source's certificates field, so re-runs usually
+         inherit a config already; we activate the first one.  If the source had
+         none, we create a minimal default so certificate generation has something
+         to work with.  Both steps are skipped when create_cert is False.
+      3. Enable self-generated certificates via the LMS certificates API.
     """
     _log(
         job.id, 'info',
         f'Applying certificates: mode={settings.course_mode} display={settings.cert_display}',
     )
+    # Step 1: Create the CourseMode row so the cert page shows the correct mode.
+    mode_applied = False
     try:
         # pylint: disable=import-outside-toplevel
         from common.djangoapps.course_modes.models import CourseMode
@@ -70,18 +120,47 @@ def apply_certificates(job, course_key, settings):
                 'expiration_datetime': None,
             },
         )
+        mode_applied = True
         _log(job.id, 'ok', f'CourseMode updated to {settings.course_mode}.')
     except ImportError:
         _log(job.id, 'warn', 'CourseMode update skipped: platform not available.')
 
     if settings.create_cert:
-        try:
-            # pylint: disable=import-outside-toplevel
-            from lms.djangoapps.certificates.api import set_cert_generation_enabled
-            set_cert_generation_enabled(course_key, True)
-            _log(job.id, 'ok', 'Certificate activated.')
-        except ImportError:
-            _log(job.id, 'warn', 'Certificate activation skipped: platform not available.')
+        if not mode_applied:
+            _log(job.id, 'warn', 'Certificate configuration skipped: no eligible course mode.')
+        else:
+            # Step 2: Activate an existing inherited cert config, or create a minimal default.
+            try:
+                # pylint: disable=import-outside-toplevel
+                from xmodule.modulestore.django import modulestore
+                store = modulestore()
+                course = store.get_course(course_key)
+                cert_list = course.certificates.get('certificates', [])
+                if cert_list:
+                    cert_list[0]['is_active'] = True
+                else:
+                    course.certificates['certificates'] = [{
+                        'id': 1,
+                        'name': 'Certificate of Completion',
+                        'description': '',
+                        'version': 1,
+                        'signatories': [],
+                        'is_active': True,
+                        'editing': False,
+                    }]
+                store.update_item(course, job.created_by.id)
+                _log(job.id, 'ok', 'Certificate configuration activated.')
+            except ImportError:
+                _log(job.id, 'warn', 'Certificate configuration skipped: platform not available.')
+
+            # Step 3: Enable self-generation so the LMS can issue certs to learners.
+            try:
+                # pylint: disable=import-outside-toplevel
+                from lms.djangoapps.certificates.api import set_cert_generation_enabled
+                set_cert_generation_enabled(course_key, True)
+                _log(job.id, 'ok', 'Certificate generation enabled.')
+            except ImportError:
+                _log(job.id, 'warn', 'Certificate generation skipped: platform not available.')
 
     _log(job.id, 'ok', '✓ Certificates applied.')
 

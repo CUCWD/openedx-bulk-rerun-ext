@@ -44,6 +44,11 @@ def mock_platform_imports():
     by applicators.py.  Yields a SimpleNamespace so tests can inspect calls or
     configure return values.
     """
+    mock_course = MagicMock()
+    mock_course.certificates = {}
+    mock_store = MagicMock()
+    mock_store.get_course.return_value = mock_course
+
     m = SimpleNamespace(
         CourseDetails=MagicMock(),
         CourseMode=MagicMock(),
@@ -56,6 +61,9 @@ def mock_platform_imports():
         Role=MagicMock(),
         seed_permissions_roles=MagicMock(),
         gating_api=MagicMock(),
+        modulestore=MagicMock(return_value=mock_store),
+        mock_store=mock_store,
+        mock_course=mock_course,
     )
     modules = {
         'openedx': MagicMock(),
@@ -89,6 +97,9 @@ def mock_platform_imports():
         'django_comment_common': MagicMock(),
         'django_comment_common.models': MagicMock(Role=m.Role),
         'django_comment_common.utils': MagicMock(seed_permissions_roles=m.seed_permissions_roles),
+        'xmodule': MagicMock(),
+        'xmodule.modulestore': MagicMock(),
+        'xmodule.modulestore.django': MagicMock(modulestore=m.modulestore),
     }
     with patch.dict(sys.modules, modules):
         yield m
@@ -228,23 +239,60 @@ class TestApplyCertificates:
         apply_certificates(job, COURSE_KEY, settings_obj)
         assert job.logs.filter(level='ok', message__icontains='CourseMode updated').exists()
 
-    def test_certificate_activated_ok_log_written(self, job, settings_obj):
+    def test_certificate_config_activated_ok_log_written(self, job, settings_obj):
         apply_certificates(job, COURSE_KEY, settings_obj)
-        assert job.logs.filter(level='ok', message__icontains='Certificate activated').exists()
+        assert job.logs.filter(level='ok', message__icontains='Certificate configuration activated').exists()
+
+    def test_certificate_generation_enabled_ok_log_written(self, job, settings_obj):
+        apply_certificates(job, COURSE_KEY, settings_obj)
+        assert job.logs.filter(level='ok', message__icontains='Certificate generation enabled').exists()
 
     def test_certificates_applied_ok_log_written(self, job, settings_obj):
         apply_certificates(job, COURSE_KEY, settings_obj)
         assert job.logs.filter(level='ok', message__icontains='Certificates applied').exists()
+
+    def test_store_update_item_called_when_create_cert_true(self, job, settings_obj, mock_platform_imports):
+        settings_obj.create_cert = True
+        apply_certificates(job, COURSE_KEY, settings_obj)
+        mock_platform_imports.mock_store.update_item.assert_called_once()
+
+    def test_existing_cert_is_activated_not_replaced(self, job, settings_obj, mock_platform_imports):
+        existing = {'id': 99, 'name': 'Existing Cert', 'is_active': False}
+        mock_platform_imports.mock_course.certificates = {'certificates': [existing]}
+        apply_certificates(job, COURSE_KEY, settings_obj)
+        assert existing['is_active'] is True
+        certs = mock_platform_imports.mock_course.certificates['certificates']
+        assert len(certs) == 1
+
+    def test_default_cert_created_when_none_inherited(self, job, settings_obj, mock_platform_imports):
+        mock_platform_imports.mock_course.certificates = {}
+        apply_certificates(job, COURSE_KEY, settings_obj)
+        certs = mock_platform_imports.mock_course.certificates['certificates']
+        assert len(certs) == 1
+        assert certs[0]['is_active'] is True
+        assert certs[0]['name'] == 'Certificate of Completion'
 
     def test_course_mode_import_error_logs_skip(self, job, settings_obj):
         with patch.dict(sys.modules, {'common.djangoapps.course_modes.models': None}):
             apply_certificates(job, COURSE_KEY, settings_obj)
         assert job.logs.filter(level='warn', message__icontains='CourseMode update skipped').exists()
 
+    def test_cert_config_skipped_when_no_mode_applied(self, job, settings_obj, mock_platform_imports):
+        with patch.dict(sys.modules, {'common.djangoapps.course_modes.models': None}):
+            apply_certificates(job, COURSE_KEY, settings_obj)
+        assert job.logs.filter(level='warn', message__icontains='no eligible course mode').exists()
+        mock_platform_imports.mock_store.update_item.assert_not_called()
+        mock_platform_imports.set_cert_generation_enabled.assert_not_called()
+
+    def test_xmodule_import_error_logs_skip(self, job, settings_obj):
+        with patch.dict(sys.modules, {'xmodule.modulestore.django': None}):
+            apply_certificates(job, COURSE_KEY, settings_obj)
+        assert job.logs.filter(level='warn', message__icontains='Certificate configuration skipped').exists()
+
     def test_cert_api_import_error_logs_skip(self, job, settings_obj):
         with patch.dict(sys.modules, {'lms.djangoapps.certificates.api': None}):
             apply_certificates(job, COURSE_KEY, settings_obj)
-        assert job.logs.filter(level='warn', message__icontains='Certificate activation skipped').exists()
+        assert job.logs.filter(level='warn', message__icontains='Certificate generation skipped').exists()
 
     def test_cert_api_import_error_does_not_prevent_mode_update(self, job, settings_obj, mock_platform_imports):
         with patch.dict(sys.modules, {'lms.djangoapps.certificates.api': None}):

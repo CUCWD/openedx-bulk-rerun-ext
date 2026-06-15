@@ -136,10 +136,32 @@ class TestValidateCourseKeysView:
         resp = auth_client.post(self.URL, {'keys': [TARGET_KEY]}, format='json')
         assert TARGET_KEY in resp.data['existing']
 
-    def test_succeeded_job_reports_key_as_existing(self, auth_client, existing_job):
+    def test_succeeded_job_alone_does_not_report_key_as_existing(self, auth_client, existing_job):
+        # A SUCCEEDED job whose course was subsequently deleted must not be
+        # flagged as a conflict — only the modulestore is authoritative.
         existing_job.status = CourseRerunJob.Status.SUCCEEDED
         existing_job.save()
         resp = auth_client.post(self.URL, {'keys': [TARGET_KEY]}, format='json')
+        assert resp.status_code == 200
+        assert TARGET_KEY not in resp.data['existing']
+
+    def test_succeeded_job_with_live_course_reports_key_as_existing(self, auth_client, existing_job):
+        # If the modulestore confirms the course still exists, it must still be flagged.
+        import sys
+        existing_job.status = CourseRerunJob.Status.SUCCEEDED
+        existing_job.save()
+        mock_store = MagicMock()
+        mock_store.has_course.return_value = True
+        fake_django_mod = MagicMock()
+        fake_django_mod.modulestore = MagicMock(return_value=mock_store)
+        fake_modules = {
+            'xmodule': MagicMock(),
+            'xmodule.modulestore': MagicMock(),
+            'xmodule.modulestore.django': fake_django_mod,
+        }
+        with patch.dict(sys.modules, fake_modules):
+            resp = auth_client.post(self.URL, {'keys': [TARGET_KEY]}, format='json')
+        assert resp.status_code == 200
         assert TARGET_KEY in resp.data['existing']
 
     def test_failed_job_does_not_block(self, auth_client, existing_job):
@@ -499,6 +521,32 @@ class TestBulkRerunBatchCreate:
         resp = auth_client.post(self.URL, self._payload(), format='json')
         assert resp.status_code == 400
         assert 'keys' in resp.data
+
+    def test_succeeded_job_for_deleted_course_allows_new_batch(self, auth_client, mock_batch_task, existing_job):
+        # A SUCCEEDED job whose course was subsequently deleted must not block
+        # a new batch submission — only the modulestore is authoritative.
+        existing_job.status = CourseRerunJob.Status.SUCCEEDED
+        existing_job.save()
+        resp = auth_client.post(self.URL, self._payload(), format='json')
+        assert resp.status_code == 202
+
+    def test_succeeded_job_with_live_course_blocks_new_batch(self, auth_client, mock_batch_task, existing_job):
+        import sys
+        existing_job.status = CourseRerunJob.Status.SUCCEEDED
+        existing_job.save()
+        mock_store = MagicMock()
+        mock_store.has_course.return_value = True
+        fake_django_mod = MagicMock()
+        fake_django_mod.modulestore = MagicMock(return_value=mock_store)
+        fake_modules = {
+            'xmodule': MagicMock(),
+            'xmodule.modulestore': MagicMock(),
+            'xmodule.modulestore.django': fake_django_mod,
+        }
+        with patch.dict(sys.modules, fake_modules):
+            resp = auth_client.post(self.URL, self._payload(), format='json')
+        assert resp.status_code == 400
+        assert TARGET_KEY in resp.data['keys']
 
     def test_failed_target_allows_new_batch(self, auth_client, mock_batch_task, existing_job):
         existing_job.status = CourseRerunJob.Status.FAILED
