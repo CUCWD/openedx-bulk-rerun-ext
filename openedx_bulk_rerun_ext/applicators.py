@@ -239,14 +239,11 @@ def apply_gating(job, course_key, settings):
     Apply lesson gating rules to the target course.
 
     Modes:
-      copy     — copy prerequisite rules from the source course.
-      template — apply a predefined template by gating_template_id.
-      custom   — not implemented in Phase 3; logs a warning.
+      copy   — copy prerequisite rules from the source course.
+      custom — chain every subsection as a prerequisite to the next,
+               using settings.gating_min_score and gating_min_completion.
     """
     _log(job.id, 'info', f'Applying lesson gating: mode={settings.gating_mode}')
-    if settings.gating_mode == 'custom':
-        _log(job.id, 'warn', 'Custom gating mode not implemented in Phase 3 — skipped.')
-        return
     try:
         # pylint: disable=import-outside-toplevel
         from opaque_keys.edx.keys import CourseKey
@@ -255,26 +252,103 @@ def apply_gating(job, course_key, settings):
         if settings.gating_mode == 'copy':
             source_key = CourseKey.from_string(job.source_course_key)
             _copy_gating_rules(gating_api, source_key, course_key)
-        elif settings.gating_mode == 'template':
-            _apply_gating_template(gating_api, course_key, settings.gating_template_id)
-
-        _log(job.id, 'ok', '✓ Lesson gating applied.')
+            _log(job.id, 'ok',
+                 f'✓ Lesson gating applied: copied prerequisite rules from {job.source_course_key}.')
+        elif settings.gating_mode == 'custom':
+            _apply_custom_gating(
+                gating_api, course_key,
+                settings.gating_min_score, settings.gating_min_completion,
+                job.created_by.id,
+            )
+            _log(job.id, 'ok',
+                 f'✓ Lesson gating applied: chained all subsections sequentially '
+                 f'(min score={settings.gating_min_score}%, '
+                 f'min completion={settings.gating_min_completion}%).')
     except ImportError:
         _log(job.id, 'warn', 'Lesson gating skipped: platform not available.')
 
 
 def _copy_gating_rules(gating_api, source_key, target_key):
-    """Copy all prerequisite gating rules from source_key to target_key."""
-    prerequisites = gating_api.get_prerequisites(source_key)
-    for prereq in prerequisites:
-        gating_api.add_prerequisite(target_key, prereq['block_key'])
+    """Copy prerequisite availability and gate assignments from source_key to target_key."""
+    from opaque_keys.edx.keys import UsageKey  # pylint: disable=import-outside-toplevel
+
+    # Step 1: Copy prerequisite availability — the "Make this subsection available
+    # as a prerequisite to other content" checkbox ('fulfills' relationship).
+    for prereq in gating_api.get_prerequisites(source_key):
+        source_usage_key = UsageKey.from_string(prereq['block_usage_key'])
+        target_usage_key = source_usage_key.map_into_course(target_key)
+        gating_api.add_prerequisite(target_key, target_usage_key)
+
+    # Step 2: Copy gate assignments — the "Prerequisite" dropdown ('requires'
+    # relationship).  get_prerequisites only covers the fulfills side; we must
+    # separately iterate the requires side to reconstruct which subsections are
+    # gated behind which prerequisites.
+    for milestone in gating_api.find_gating_milestones(source_key, relationship='requires'):
+        gated_source_key = UsageKey.from_string(milestone['content_id'])
+        gated_target_key = gated_source_key.map_into_course(target_key)
+
+        prereq_source_str, min_score, min_completion = gating_api.get_required_content(
+            source_key, gated_source_key
+        )
+        if not prereq_source_str:
+            continue
+        prereq_target_key = UsageKey.from_string(prereq_source_str).map_into_course(target_key)
+
+        gating_api.set_required_content(
+            target_key, gated_target_key, prereq_target_key,
+            '' if min_score is None else min_score,
+            '' if min_completion is None else min_completion,
+        )
 
 
-def _apply_gating_template(gating_api, course_key, template_id):
-    """Apply a named gating template to the course; no-op if template_id is empty."""
-    if not template_id:
+def _apply_custom_gating(gating_api, course_key, min_score, min_completion, user_id):
+    """
+    Chain every subsection as a sequential prerequisite gate.
+
+    For a course with subsections [A, B, C, D]:
+      - A, B, C are marked as available prerequisites ('fulfills').
+      - B requires A, C requires B, D requires C ('requires'),
+        each with the configured min_score and min_completion thresholds.
+    Subsection gating is enabled on the course XBlock if not already set.
+    """
+    from xmodule.modulestore.django import modulestore  # pylint: disable=import-outside-toplevel
+
+    # Fetch the course with depth=2 so chapter and subsection children are loaded.
+    store = modulestore()
+    course = store.get_course(course_key, depth=2)
+
+    # Collect all subsection locations in course order (chapters → sequentials).
+    subsections = [
+        subsection.location
+        for chapter in course.get_children()
+        for subsection in chapter.get_children()
+    ]
+
+    # Nothing to gate if there is only one subsection (no "previous" to require).
+    if len(subsections) < 2:
         return
-    gating_api.add_prerequisite(course_key, template_id)
+
+    # Enable subsection gating on the course XBlock; without this flag the
+    # gating API's @gating_enabled decorator short-circuits all gate checks.
+    if not course.enable_subsection_gating:
+        course.enable_subsection_gating = True
+        store.update_item(course, user_id)
+
+    # Mark every subsection except the last as an available prerequisite so it
+    # appears in the "Prerequisite" dropdown for subsequent subsections.
+    for location in subsections[:-1]:
+        gating_api.add_prerequisite(course_key, location)
+
+    # Wire up the sequential gate: each subsection requires the one before it,
+    # with the operator-configured minimum score and completion thresholds.
+    for i in range(1, len(subsections)):
+        gating_api.set_required_content(
+            course_key,
+            subsections[i],      # gated subsection
+            subsections[i - 1],  # prerequisite (previous subsection)
+            min_score,
+            min_completion,
+        )
 
 
 def remove_provisioner(job, course_key, requesting_user):

@@ -214,7 +214,6 @@ class CourseRerunSettings(models.Model):
 
         DISABLED = 'disabled', 'Disabled'
         COPY = 'copy', 'Copy from source'
-        TEMPLATE = 'template', 'Apply template'
         CUSTOM = 'custom', 'Custom (not implemented)'
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
@@ -240,7 +239,8 @@ class CourseRerunSettings(models.Model):
 
     # Lesson gating
     gating_mode = models.CharField(max_length=16, choices=GatingMode.choices, default=GatingMode.DISABLED)
-    gating_template_id = models.CharField(max_length=128, blank=True, default='')
+    gating_min_score = models.CharField(max_length=3, blank=True, default='80')
+    gating_min_completion = models.CharField(max_length=3, blank=True, default='100')
 
     # Provisioner cleanup
     remove_provisioner_after = models.BooleanField(default=True)

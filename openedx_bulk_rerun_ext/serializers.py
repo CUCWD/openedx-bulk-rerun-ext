@@ -65,7 +65,7 @@ class CourseRerunSettingsSerializer(serializers.ModelSerializer):
             'enrollment_start', 'enrollment_end',
             'pacing',
             'course_mode', 'cert_display', 'create_cert', 'student_gen_cert', 'cert_on_dashboard',
-            'gating_mode', 'gating_template_id',
+            'gating_mode', 'gating_min_score', 'gating_min_completion',
             'remove_provisioner_after',
         ]
 
