@@ -353,14 +353,16 @@ class BulkRerunBatchListCreateView(APIView):
         CourseRerunSettings.objects.create(batch=batch, **settings_data)
 
         # Create one team member row per CAR entry (may be empty list).
-        # Deduplicate by email — the same person may appear in multiple org
-        # rosters in the wizard; keep the first occurrence of each email.
-        seen_emails: set = set()
+        # Deduplicate by (org, email) — the same person legitimately appears in
+        # multiple org rosters with different org values; only exact (org, email)
+        # duplicates within the same batch payload are dropped.
+        seen: set = set()
         for member in data.get('team_members', []):
             email = (member.get('email') or '').strip()
-            if not email or email in seen_emails:
+            org = (member.get('org') or '').strip()
+            if not email or (org, email) in seen:
                 continue
-            seen_emails.add(email)
+            seen.add((org, email))
             CourseRerunTeamMember.objects.create(batch=batch, **member)
 
         from .tasks import dispatch_batch_rerun, _dispatch_task  # pylint: disable=import-outside-toplevel

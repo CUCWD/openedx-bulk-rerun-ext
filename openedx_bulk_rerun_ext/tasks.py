@@ -288,6 +288,7 @@ def apply_course_settings(self, job_id):
             apply_gating,
             apply_scheduling,
             apply_team_access,
+            enroll_provisioner,
             ensure_org_course_association,
             remove_provisioner,
         )
@@ -304,9 +305,11 @@ def apply_course_settings(self, job_id):
             _log(job.id, 'ok', '[DRY-RUN] ✓ Dry-run complete. No changes were made.')
         else:
             ensure_org_course_association(job, course_key)
+            enroll_provisioner(job, course_key, job.created_by, s)
             apply_scheduling(job, course_key, s)
             apply_certificates(job, course_key, s)
-            apply_team_access(job, course_key, s, batch.team_members.all(), job.created_by)
+            org_members = batch.team_members.filter(org=course_key.org)
+            apply_team_access(job, course_key, s, org_members, job.created_by)
             if s.gating_mode != 'disabled':
                 apply_gating(job, course_key, s)
             if s.remove_provisioner_after:

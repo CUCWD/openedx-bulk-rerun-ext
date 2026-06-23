@@ -165,14 +165,15 @@ def apply_certificates(job, course_key, settings):
     _log(job.id, 'ok', '✓ Certificates applied.')
 
 
-def apply_team_access(job, course_key, settings, team_members, requesting_user):  # pylint: disable=unused-argument
+def apply_team_access(job, course_key, settings, team_members, requesting_user):
     """
     Add each CAR team member to the target course with the configured roles.
 
     Studio role is applied via add_instructor (admin) or auth.add_users (staff /
     data_researcher).  Discussion role is applied via the forum role manager when
-    the role is not "none".  Members whose email is not found on the platform are
-    skipped with a warning log line.
+    the role is not "none".  Each member is also enrolled in the course using the
+    batch's configured course_mode so they can access the course in the LMS.
+    Members whose email is not found on the platform are skipped with a warning.
     """
     _log(job.id, 'info', 'Assigning team members from CAR...')
     try:
@@ -200,6 +201,16 @@ def apply_team_access(job, course_key, settings, team_members, requesting_user):
             elif studio_role == 'data_researcher':
                 from common.djangoapps.student.roles import DataResearcherRole
                 auth.add_users(requesting_user, DataResearcherRole(course_key), user)
+
+            # Enroll the team member so they can access the course in the LMS.
+            try:
+                from common.djangoapps.student.models import CourseEnrollment
+                CourseEnrollment.enroll(user, course_key, mode=settings.course_mode)
+                _log(job.id, 'ok', f'Enrolled {email} in {course_key} ({settings.course_mode}).')
+            except ImportError:
+                _log(job.id, 'warn', f'Enrollment skipped for {email}: platform not available.')
+            except Exception as exc:  # pylint: disable=broad-exception-caught
+                _log(job.id, 'warn', f'Enrollment failed for {email} (non-fatal): {exc}')
 
             _apply_discussion_role(job, course_key, user, member.discussion_role)
             _log(job.id, 'ok', f'Added {email} as {studio_role}.')
@@ -349,6 +360,27 @@ def _apply_custom_gating(gating_api, course_key, min_score, min_completion, user
             min_score,
             min_completion,
         )
+
+
+def enroll_provisioner(job, course_key, requesting_user, settings):
+    """
+    Enroll the provisioner in the newly created course using the batch-configured
+    course_mode.
+
+    Called immediately after course creation so the provisioner has a valid
+    enrollment record before any other settings (certificates, team access) are
+    applied.  The enrollment is also updated here so that if remove_provisioner
+    later strips the admin role, the student record already reflects the correct
+    mode rather than defaulting to 'audit'.
+    """
+    try:
+        from common.djangoapps.student.models import CourseEnrollment  # pylint: disable=import-outside-toplevel
+        CourseEnrollment.enroll(requesting_user, course_key, mode=settings.course_mode)
+        _log(job.id, 'ok', f'Provisioner enrolled in {course_key} ({settings.course_mode}).')
+    except ImportError:
+        _log(job.id, 'warn', 'Provisioner enrollment skipped: platform not available.')
+    except Exception as exc:  # pylint: disable=broad-exception-caught
+        _log(job.id, 'warn', f'Provisioner enrollment failed (non-fatal): {exc}')
 
 
 def remove_provisioner(job, course_key, requesting_user):

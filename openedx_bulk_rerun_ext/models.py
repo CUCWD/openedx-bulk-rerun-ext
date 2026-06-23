@@ -250,8 +250,9 @@ class CourseRerunTeamMember(models.Model):
     """
     A single CAR (Course Assignment Roster) entry for a bulk rerun batch.
 
-    One row per team member listed in the Step 2 Team & Access tab of the UI.
-    All members are added to every course created within the batch.
+    One row per team member per org listed in the Step 2 Team & Access tab.
+    Members are scoped to their org and only applied to courses whose
+    CourseKey.org matches the ``org`` field on this record.
 
     .. no_pii: Email is operational metadata used solely for user lookup during
         course provisioning; it is not displayed or processed beyond that lookup.
@@ -276,6 +277,12 @@ class CourseRerunTeamMember(models.Model):
         on_delete=models.CASCADE,
         related_name='team_members',
     )
+    org = models.CharField(
+        max_length=64,
+        blank=True,
+        default='',
+        help_text='Organization short_name this member belongs to. Empty = apply to all orgs (legacy).',
+    )
     email = models.EmailField()
     studio_role = models.CharField(max_length=32, choices=StudioRole.choices, default=StudioRole.ADMIN)
     discussion_role = models.CharField(
@@ -287,8 +294,8 @@ class CourseRerunTeamMember(models.Model):
     class Meta:
         """Ordering and uniqueness constraints for team member entries."""
 
-        ordering = ['email']
-        unique_together = [('batch', 'email')]
+        ordering = ['org', 'email']
+        unique_together = [('batch', 'org', 'email')]
 
 
 class CourseRerunLog(models.Model):

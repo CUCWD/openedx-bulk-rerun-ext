@@ -87,7 +87,7 @@ class CourseRerunTeamMemberSerializer(serializers.ModelSerializer):
         """Expose the three fields submitted by the UI Team & Access tab."""
 
         model = CourseRerunTeamMember
-        fields = ['email', 'studio_role', 'discussion_role']
+        fields = ['org', 'email', 'studio_role', 'discussion_role']
 
 
 class _CourseEntrySerializer(serializers.Serializer):  # pylint: disable=abstract-method

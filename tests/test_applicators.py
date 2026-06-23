@@ -22,6 +22,7 @@ from openedx_bulk_rerun_ext.applicators import (
     apply_gating,
     apply_scheduling,
     apply_team_access,
+    enroll_provisioner,
     remove_provisioner,
 )
 from openedx_bulk_rerun_ext.models import BulkRerunBatch, CourseRerunJob, CourseRerunSettings, CourseRerunTeamMember
@@ -54,6 +55,7 @@ def mock_platform_imports():
         set_cert_generation_enabled=MagicMock(),
         add_instructor=MagicMock(),
         auth=MagicMock(),
+        CourseEnrollment=MagicMock(),
         CourseStaffRole=MagicMock(),
         CourseInstructorRole=MagicMock(),
         DataResearcherRole=MagicMock(),
@@ -88,6 +90,7 @@ def mock_platform_imports():
         'common.djangoapps.course_modes.models': MagicMock(CourseMode=m.CourseMode),
         'common.djangoapps.student': MagicMock(auth=m.auth),
         'common.djangoapps.student.auth': m.auth,
+        'common.djangoapps.student.models': MagicMock(CourseEnrollment=m.CourseEnrollment),
         'common.djangoapps.student.roles': MagicMock(
             CourseStaffRole=m.CourseStaffRole,
             CourseInstructorRole=m.CourseInstructorRole,
@@ -358,6 +361,30 @@ class TestApplyTeamAccess:
         apply_team_access(job, COURSE_KEY, settings_obj, [], user)
         assert job.logs.filter(level='ok', message__icontains='Team access applied').exists()
 
+    def test_member_enrolled_with_batch_course_mode(
+        self, job, settings_obj, user, batch, member_user, mock_platform_imports,
+    ):
+        member = self._make_member(batch, member_user.email, 'admin')
+        apply_team_access(job, COURSE_KEY, settings_obj, [member], user)
+        mock_platform_imports.CourseEnrollment.enroll.assert_called_once_with(
+            member_user, COURSE_KEY, mode=settings_obj.course_mode,
+        )
+        assert job.logs.filter(level='ok', message__icontains='Enrolled member@example.com').exists()
+
+    def test_enrollment_failure_is_non_fatal(
+        self, job, settings_obj, user, batch, member_user, mock_platform_imports,
+    ):
+        mock_platform_imports.CourseEnrollment.enroll.side_effect = RuntimeError('enroll error')
+        member = self._make_member(batch, member_user.email, 'admin')
+        apply_team_access(job, COURSE_KEY, settings_obj, [member], user)
+        assert job.logs.filter(level='warn', message__icontains='Enrollment failed').exists()
+
+    def test_enrollment_import_error_logs_skip(self, job, settings_obj, user, batch, member_user):
+        member = self._make_member(batch, member_user.email, 'admin')
+        with patch.dict(sys.modules, {'common.djangoapps.student.models': None}):
+            apply_team_access(job, COURSE_KEY, settings_obj, [member], user)
+        assert job.logs.filter(level='warn', message__icontains='Enrollment skipped').exists()
+
     def test_import_error_logs_skip(self, job, settings_obj, user):
         with patch.dict(sys.modules, {'cms.djangoapps.contentstore.utils': None}):
             apply_team_access(job, COURSE_KEY, settings_obj, [], user)
@@ -488,6 +515,30 @@ class TestCopyGatingRules:
 
 
 # ── remove_provisioner ────────────────────────────────────────────────────────
+
+class TestEnrollProvisioner:
+    """enroll_provisioner creates/updates the provisioner enrollment immediately after course creation."""
+
+    def test_enroll_called_with_batch_course_mode(self, job, settings_obj, user, mock_platform_imports):
+        enroll_provisioner(job, COURSE_KEY, user, settings_obj)
+        mock_platform_imports.CourseEnrollment.enroll.assert_called_once_with(
+            user, COURSE_KEY, mode=settings_obj.course_mode,
+        )
+
+    def test_success_ok_log_written(self, job, settings_obj, user):
+        enroll_provisioner(job, COURSE_KEY, user, settings_obj)
+        assert job.logs.filter(level='ok', message__icontains='Provisioner enrolled').exists()
+
+    def test_import_error_logs_skip(self, job, settings_obj, user):
+        with patch.dict(sys.modules, {'common.djangoapps.student.models': None}):
+            enroll_provisioner(job, COURSE_KEY, user, settings_obj)
+        assert job.logs.filter(level='warn', message__icontains='Provisioner enrollment skipped').exists()
+
+    def test_exception_is_non_fatal(self, job, settings_obj, user, mock_platform_imports):
+        mock_platform_imports.CourseEnrollment.enroll.side_effect = RuntimeError('enroll error')
+        enroll_provisioner(job, COURSE_KEY, user, settings_obj)
+        assert job.logs.filter(level='warn', message__icontains='Provisioner enrollment failed').exists()
+
 
 class TestRemoveProvisioner:
     """remove_provisioner strips course admin and staff roles from the requesting user."""
