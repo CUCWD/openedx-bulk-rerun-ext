@@ -17,7 +17,6 @@ from opaque_keys.edx.keys import CourseKey
 
 from openedx_bulk_rerun_ext.applicators import (
     _apply_discussion_role,
-    _apply_gating_template,
     _copy_gating_rules,
     apply_certificates,
     apply_gating,
@@ -147,7 +146,6 @@ def settings_obj(batch):
         student_gen_cert=True,
         cert_on_dashboard=True,
         gating_mode='copy',
-        gating_template_id='',
         remove_provisioner_after=True,
     )
 
@@ -427,29 +425,13 @@ class TestApplyDiscussionRole:
 # ── apply_gating ──────────────────────────────────────────────────────────────
 
 class TestApplyGating:
-    """apply_gating delegates to _copy_gating_rules or _apply_gating_template."""
+    """apply_gating delegates to _copy_gating_rules when mode is 'copy'."""
 
     def test_copy_mode_calls_get_prerequisites(self, job, settings_obj, mock_platform_imports):
         settings_obj.gating_mode = 'copy'
         mock_platform_imports.gating_api.get_prerequisites.return_value = []
         apply_gating(job, COURSE_KEY, settings_obj)
         mock_platform_imports.gating_api.get_prerequisites.assert_called_once()
-
-    def test_template_mode_calls_add_prerequisite(self, job, settings_obj, mock_platform_imports):
-        settings_obj.gating_mode = 'template'
-        settings_obj.gating_template_id = 'block-v1:ORG+CS+RUN+type@unit+block@abc'
-        apply_gating(job, COURSE_KEY, settings_obj)
-        mock_platform_imports.gating_api.add_prerequisite.assert_called_once_with(
-            COURSE_KEY, 'block-v1:ORG+CS+RUN+type@unit+block@abc',
-        )
-
-    def test_custom_mode_skips_platform_calls_and_logs_warn(
-        self, job, settings_obj, mock_platform_imports,
-    ):
-        settings_obj.gating_mode = 'custom'
-        apply_gating(job, COURSE_KEY, settings_obj)
-        mock_platform_imports.gating_api.add_prerequisite.assert_not_called()
-        assert job.logs.filter(level='warn', message__icontains='Custom gating').exists()
 
     def test_success_ok_log_written(self, job, settings_obj, mock_platform_imports):
         settings_obj.gating_mode = 'copy'
@@ -502,24 +484,6 @@ class TestCopyGatingRules:
         source_key = CourseKey.from_string(SOURCE_KEY)
         gating_api.get_prerequisites.return_value = []
         _copy_gating_rules(gating_api, source_key, COURSE_KEY)
-        gating_api.add_prerequisite.assert_not_called()
-
-
-# ── _apply_gating_template ────────────────────────────────────────────────────
-
-class TestApplyGatingTemplate:
-    """_apply_gating_template registers a single named block as a prerequisite."""
-
-    def test_add_prerequisite_called_with_template_id(self, mock_platform_imports):
-        gating_api = mock_platform_imports.gating_api
-        _apply_gating_template(gating_api, COURSE_KEY, 'block-v1:ORG+CS+RUN+type@unit+block@tmpl')
-        gating_api.add_prerequisite.assert_called_once_with(
-            COURSE_KEY, 'block-v1:ORG+CS+RUN+type@unit+block@tmpl',
-        )
-
-    def test_empty_template_id_is_no_op(self, mock_platform_imports):
-        gating_api = mock_platform_imports.gating_api
-        _apply_gating_template(gating_api, COURSE_KEY, '')
         gating_api.add_prerequisite.assert_not_called()
 
 
