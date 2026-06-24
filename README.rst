@@ -29,6 +29,49 @@ Please see the Open edX documentation for `guidance on Python development`_ in t
 
 .. _guidance on Python development: https://docs.openedx.org/en/latest/developers/how-tos/get-ready-for-python-dev.html
 
+Django Configuration Flags
+**************************
+
+The following Django settings control the behavior of this extension.
+Add them to your CMS settings file (e.g. ``cms/envs/production.py`` or a
+Tutor ``openedx-cms-production-settings`` patch).
+
+``BULK_RERUN_USE_CELERY``
+=========================
+
+**Type:** ``bool`` — **Default:** ``False``
+
+Controls how the batch task chain is dispatched after a successful
+``POST /api/bulk-rerun/batches/`` request.
+
+``False`` (default)
+  The fan-out task and all child tasks run **synchronously in a background
+  daemon thread** inside the CMS web process.  The HTTP response returns
+  immediately (202 Accepted) while the thread works through the job queue.
+  No separate Celery worker is required.  Suitable for development and
+  single-server deployments.
+
+``True``
+  Tasks are dispatched to the **Celery broker** via ``apply_async()``.
+  A running ``cms-worker`` Celery process (or container) is required to
+  consume them.  Use this in production environments that already run a
+  dedicated CMS Celery worker for full distributed execution.
+
+.. code-block:: python
+
+   # Production (Tutor openedx-cms-production-settings patch)
+   BULK_RERUN_USE_CELERY = True
+
+   # Development without a Celery worker (default — no setting needed)
+   # BULK_RERUN_USE_CELERY = False
+
+.. note::
+
+   When ``BULK_RERUN_USE_CELERY = False``, the ``CELERY_ALWAYS_EAGER`` /
+   ``CELERY_TASK_ALWAYS_EAGER`` settings have no effect on this extension.
+   Task execution is always synchronous in the background thread regardless
+   of those flags.
+
 Deploying
 *********
 

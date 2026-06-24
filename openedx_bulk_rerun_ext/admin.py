@@ -48,7 +48,7 @@ class CourseRerunSettingsInline(admin.StackedInline):
     readonly_fields = [
         'pacing', 'course_start', 'course_end', 'enrollment_start', 'enrollment_end',
         'course_mode', 'cert_display', 'create_cert', 'student_gen_cert', 'cert_on_dashboard',
-        'gating_mode', 'gating_template_id', 'remove_provisioner_after',
+        'gating_mode', 'gating_min_score', 'gating_min_completion', 'remove_provisioner_after',
     ]
 
     def has_add_permission(self, _request, _obj=None):

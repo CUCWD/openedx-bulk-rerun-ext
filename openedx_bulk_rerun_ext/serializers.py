@@ -1,6 +1,7 @@
 """
 Serializers for openedx_bulk_rerun_ext.
 """
+from django.utils import timezone
 from opaque_keys import InvalidKeyError
 from opaque_keys.edx.keys import CourseKey
 from rest_framework import serializers
@@ -64,7 +65,7 @@ class CourseRerunSettingsSerializer(serializers.ModelSerializer):
             'enrollment_start', 'enrollment_end',
             'pacing',
             'course_mode', 'cert_display', 'create_cert', 'student_gen_cert', 'cert_on_dashboard',
-            'gating_mode', 'gating_template_id',
+            'gating_mode', 'gating_min_score', 'gating_min_completion',
             'remove_provisioner_after',
         ]
 
@@ -86,7 +87,7 @@ class CourseRerunTeamMemberSerializer(serializers.ModelSerializer):
         """Expose the three fields submitted by the UI Team & Access tab."""
 
         model = CourseRerunTeamMember
-        fields = ['email', 'studio_role', 'discussion_role']
+        fields = ['org', 'email', 'studio_role', 'discussion_role']
 
 
 class _CourseEntrySerializer(serializers.Serializer):  # pylint: disable=abstract-method
@@ -139,10 +140,21 @@ class BulkRerunBatchCreateSerializer(serializers.Serializer):  # pylint: disable
         return attrs
 
 
+class CourseRerunLogSerializer(serializers.ModelSerializer):
+    """Read serializer for individual log lines."""
+
+    class Meta:
+        """Expose all log line fields."""
+
+        model = CourseRerunLog
+        fields = ['id', 'level', 'message', 'created_at']
+
+
 class CourseRerunJobBriefSerializer(serializers.ModelSerializer):
     """Compact job summary nested inside a batch detail response."""
 
     elapsed_seconds = serializers.SerializerMethodField()
+    logs = CourseRerunLogSerializer(many=True, read_only=True)
 
     class Meta:
         """Expose timing and status fields relevant to the Track Progress UI."""
@@ -153,23 +165,26 @@ class CourseRerunJobBriefSerializer(serializers.ModelSerializer):
             'source_course_key', 'target_course_key',
             'started_at', 'completed_at', 'elapsed_seconds',
             'error_message',
+            'logs',
         ]
 
     def get_elapsed_seconds(self, obj):
-        """Return wall-clock seconds between started_at and completed_at, or None."""
-        if obj.started_at and obj.completed_at:
-            return (obj.completed_at - obj.started_at).total_seconds()
+        """Return wall-clock seconds since started_at; uses now() for in-progress jobs."""
+        if obj.started_at:
+            end = obj.completed_at or timezone.now()
+            return (end - obj.started_at).total_seconds()
         return None
 
 
 class BulkRerunBatchSerializer(serializers.ModelSerializer):
-    """Read serializer for the batch detail and list endpoints."""
+    """Read serializer for the batch detail endpoint (includes nested jobs + logs)."""
 
     jobs = CourseRerunJobBriefSerializer(many=True, read_only=True)
     total_jobs = serializers.IntegerField(read_only=True)
     done_jobs = serializers.IntegerField(read_only=True)
     failed_jobs = serializers.IntegerField(read_only=True)
     settings_applied_count = serializers.SerializerMethodField()
+    phase = serializers.SerializerMethodField()
 
     class Meta:
         """Expose all batch-level fields plus the nested jobs list."""
@@ -178,6 +193,7 @@ class BulkRerunBatchSerializer(serializers.ModelSerializer):
         fields = [
             'id', 'status', 'mode', 'is_dry_run', 'target_run', 'prog_id',
             'total_jobs', 'done_jobs', 'failed_jobs', 'settings_applied_count',
+            'phase',
             'created_at', 'completed_at',
             'jobs',
         ]
@@ -186,12 +202,42 @@ class BulkRerunBatchSerializer(serializers.ModelSerializer):
         """Return the number of jobs in this batch that have had settings applied."""
         return obj.jobs.filter(settings_applied=True).count()
 
+    def get_phase(self, obj):
+        """
+        Derive the active UI phase from batch status.
 
-class CourseRerunLogSerializer(serializers.ModelSerializer):
-    """Read serializer for individual log lines."""
+        The batch model has no explicit phase column — phases 2 and 3 (Discovery
+        sync, program linking) run inside the same Celery task chain and are not
+        separately tracked.  Phase 4 signals completion to the frontend so it can
+        show the Export summary button and stop polling.
+        """
+        if obj.status in (
+            BulkRerunBatch.Status.SUCCEEDED,
+            BulkRerunBatch.Status.FAILED,
+            BulkRerunBatch.Status.PARTIAL,
+        ):
+            return 4
+        return 1  # pending or running — course creation phase
+
+
+class BulkRerunBatchSummarySerializer(serializers.ModelSerializer):
+    """
+    Lightweight serializer for the batch list endpoint.
+
+    Omits nested jobs and logs (which can be large) but includes config_json
+    so the frontend can reconstruct the progress UI display context (org names,
+    program info, fromMode, etc.) when recovering in-flight batches after a
+    page refresh or on a different device.
+    """
+
+    created_by_username = serializers.CharField(source='created_by.username', read_only=True)
 
     class Meta:
-        """Expose all log line fields."""
+        """Expose summary fields for the batch list endpoint; excludes nested jobs and logs."""
 
-        model = CourseRerunLog
-        fields = ['id', 'level', 'message', 'created_at']
+        model = BulkRerunBatch
+        fields = [
+            'id', 'status', 'mode', 'is_dry_run', 'target_run', 'prog_id',
+            'created_at', 'completed_at', 'created_by_username',
+            'config_json',
+        ]

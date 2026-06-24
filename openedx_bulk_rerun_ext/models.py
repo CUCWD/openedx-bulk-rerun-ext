@@ -52,6 +52,16 @@ class BulkRerunBatch(models.Model):
         default=Status.PENDING,
         db_index=True,
     )
+    config_json = models.JSONField(
+        null=True,
+        blank=True,
+        default=None,
+        help_text=(
+            'Snapshot of the wizard cfg object (rows, prog, fromMode, etc.) '
+            'stored at submission time so the progress UI can reconstruct '
+            'display context on any device or after a page refresh.'
+        ),
+    )
 
     class Meta:
         """Default ordering for batch listings."""
@@ -148,7 +158,7 @@ class CourseRerunJob(models.Model):
         default=JobType.INDIVIDUAL,
     )
     source_course_key = models.CharField(max_length=255)
-    target_course_key = models.CharField(max_length=255, unique=True)
+    target_course_key = models.CharField(max_length=255)
     celery_task_id = models.CharField(max_length=255, null=True, blank=True)
     error_message = models.TextField(blank=True, default='')
 
@@ -204,7 +214,6 @@ class CourseRerunSettings(models.Model):
 
         DISABLED = 'disabled', 'Disabled'
         COPY = 'copy', 'Copy from source'
-        TEMPLATE = 'template', 'Apply template'
         CUSTOM = 'custom', 'Custom (not implemented)'
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
@@ -230,7 +239,8 @@ class CourseRerunSettings(models.Model):
 
     # Lesson gating
     gating_mode = models.CharField(max_length=16, choices=GatingMode.choices, default=GatingMode.DISABLED)
-    gating_template_id = models.CharField(max_length=128, blank=True, default='')
+    gating_min_score = models.CharField(max_length=3, blank=True, default='80')
+    gating_min_completion = models.CharField(max_length=3, blank=True, default='100')
 
     # Provisioner cleanup
     remove_provisioner_after = models.BooleanField(default=True)
@@ -240,8 +250,9 @@ class CourseRerunTeamMember(models.Model):
     """
     A single CAR (Course Assignment Roster) entry for a bulk rerun batch.
 
-    One row per team member listed in the Step 2 Team & Access tab of the UI.
-    All members are added to every course created within the batch.
+    One row per team member per org listed in the Step 2 Team & Access tab.
+    Members are scoped to their org and only applied to courses whose
+    CourseKey.org matches the ``org`` field on this record.
 
     .. no_pii: Email is operational metadata used solely for user lookup during
         course provisioning; it is not displayed or processed beyond that lookup.
@@ -266,6 +277,12 @@ class CourseRerunTeamMember(models.Model):
         on_delete=models.CASCADE,
         related_name='team_members',
     )
+    org = models.CharField(
+        max_length=64,
+        blank=True,
+        default='',
+        help_text='Organization short_name this member belongs to. Empty = apply to all orgs (legacy).',
+    )
     email = models.EmailField()
     studio_role = models.CharField(max_length=32, choices=StudioRole.choices, default=StudioRole.ADMIN)
     discussion_role = models.CharField(
@@ -277,8 +294,8 @@ class CourseRerunTeamMember(models.Model):
     class Meta:
         """Ordering and uniqueness constraints for team member entries."""
 
-        ordering = ['email']
-        unique_together = [('batch', 'email')]
+        ordering = ['org', 'email']
+        unique_together = [('batch', 'org', 'email')]
 
 
 class CourseRerunLog(models.Model):
