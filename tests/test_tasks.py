@@ -11,6 +11,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 from django.contrib.auth import get_user_model
+from django.db.utils import IntegrityError
 from django.utils import timezone
 
 from openedx_bulk_rerun_ext.models import BulkRerunBatch, CourseRerunJob, CourseRerunLog, CourseRerunSettings
@@ -58,6 +59,12 @@ def mock_platform_imports(rerun_course_mock, course_rerun_state_mock):
         'common.djangoapps.course_action_state': MagicMock(),
         'common.djangoapps.course_action_state.models': MagicMock(
             CourseRerunState=course_rerun_state_mock
+        ),
+        'organizations': MagicMock(),
+        'organizations.models': MagicMock(
+            OrganizationCourse=MagicMock(
+                **{'objects.filter.return_value.delete.return_value': (0, {})}
+            )
         ),
     }
     with patch.dict(sys.modules, modules):
@@ -231,7 +238,7 @@ class TestRunCourseRerunLogging:
     def test_first_log_is_provisioning_created(self, job, rerun_course_mock):
         run_course_rerun.apply(args=[str(job.id)])
         first = job.logs.first()
-        assert 'ProvisioningJob created' in first.message
+        assert 'ProvisioningJob' in first.message and 'created for batch' in first.message
 
     def test_success_log_written_on_success(self, job, rerun_course_mock):
         run_course_rerun.apply(args=[str(job.id)])
@@ -249,6 +256,81 @@ class TestRunCourseRerunLogging:
         run_course_rerun.apply(args=[str(job.id)])
         err_log = job.logs.filter(level=CourseRerunLog.Level.ERR).first()
         assert 'duplicate course' in err_log.message
+
+
+# ── Phase 2: edge paths in run_course_rerun ───────────────────────────────────
+
+class TestRunCourseRerunEdgePaths:
+    """run_course_rerun handles stale org rows, template prefixes, and error recovery."""
+
+    def test_stale_org_rows_deleted_logs_count(self, job, rerun_course_mock):
+        """Deleting stale OrganizationCourse rows is logged when deleted_count > 0."""
+        sys.modules['organizations.models'].OrganizationCourse.objects.filter.return_value.delete.return_value = (2, {})
+        run_course_rerun.apply(args=[str(job.id)])
+        assert job.logs.filter(level='info', message__icontains='Removed 2 stale').exists()
+
+    def test_template_prefix_stripped_from_display_name(self, job, rerun_course_mock):
+        """When the source course name starts with a template prefix, it is stripped."""
+        src_course = MagicMock()
+        src_course.display_name = 'Demo: My Course'
+        mock_store = MagicMock()
+        mock_store.get_course.return_value = src_course
+        fake_xmodule = {
+            'xmodule': MagicMock(), 'xmodule.modulestore': MagicMock(),
+            'xmodule.modulestore.django': MagicMock(modulestore=MagicMock(return_value=mock_store)),
+        }
+        with patch.dict(sys.modules, fake_xmodule):
+            run_course_rerun.apply(args=[str(job.id)])
+        assert job.logs.filter(message__icontains='Stripped template prefix').exists()
+
+    def test_rerun_failure_with_existing_course_dispatches_settings(self, job, rerun_course_mock):
+        """When rerun_course fails but the course already exists, settings are applied instead."""
+        rerun_course_mock.apply.return_value = MagicMock(result='duplicate course')
+        mock_store = MagicMock()
+        mock_store.has_course.return_value = True
+        fake_xmodule = {
+            'xmodule': MagicMock(), 'xmodule.modulestore': MagicMock(),
+            'xmodule.modulestore.django': MagicMock(modulestore=MagicMock(return_value=mock_store)),
+        }
+        with patch.dict(sys.modules, fake_xmodule), \
+             patch('openedx_bulk_rerun_ext.tasks.apply_course_settings.apply'):
+            run_course_rerun.apply(args=[str(job.id)])
+        assert job.logs.filter(level='warn', message__icontains='already exists').exists()
+
+    def test_integrity_error_with_target_key_dispatches_settings(self, job, rerun_course_mock):
+        """An IntegrityError for the target course key triggers settings dispatch, not failure."""
+        rerun_course_mock.apply.side_effect = IntegrityError(
+            f'Duplicate entry for {job.target_course_key}'
+        )
+        with patch('openedx_bulk_rerun_ext.tasks.apply_course_settings.apply'):
+            run_course_rerun.apply(args=[str(job.id)])
+        assert job.logs.filter(level='warn', message__icontains='already exists').exists()
+
+    def test_src_course_none_skips_display_name_strip(self, job, rerun_course_mock):
+        """When modulestore returns None for the source course, display_name stripping is skipped."""
+        mock_store = MagicMock()
+        mock_store.get_course.return_value = None
+        fake_xmodule = {
+            'xmodule': MagicMock(), 'xmodule.modulestore': MagicMock(),
+            'xmodule.modulestore.django': MagicMock(modulestore=MagicMock(return_value=mock_store)),
+        }
+        with patch.dict(sys.modules, fake_xmodule):
+            run_course_rerun.apply(args=[str(job.id)])
+        assert not job.logs.filter(message__icontains='Stripped template prefix').exists()
+
+    def test_no_template_prefix_leaves_fields_json_none(self, job, rerun_course_mock):
+        """A display_name without a template prefix passes the name unchanged."""
+        src_course = MagicMock()
+        src_course.display_name = 'Regular Course Title'
+        mock_store = MagicMock()
+        mock_store.get_course.return_value = src_course
+        fake_xmodule = {
+            'xmodule': MagicMock(), 'xmodule.modulestore': MagicMock(),
+            'xmodule.modulestore.django': MagicMock(modulestore=MagicMock(return_value=mock_store)),
+        }
+        with patch.dict(sys.modules, fake_xmodule):
+            run_course_rerun.apply(args=[str(job.id)])
+        assert not job.logs.filter(message__icontains='Stripped template prefix').exists()
 
 
 # ── Phase 2: dry-run mode ─────────────────────────────────────────────────────
@@ -371,7 +453,7 @@ class TestDispatchBatchRerun:
             target_course_key=TARGET_KEY,
             created_by=user, batch=batch, position=0,
         )
-        with patch('openedx_bulk_rerun_ext.tasks.run_course_rerun.apply_async'):
+        with patch('openedx_bulk_rerun_ext.tasks.run_course_rerun.apply'):
             dispatch_batch_rerun.apply(args=[str(batch.id)])
         batch.refresh_from_db()
         assert batch.status == BulkRerunBatch.Status.RUNNING
@@ -383,11 +465,12 @@ class TestDispatchBatchRerun:
                 target_course_key=f'course-v1:ORG+TEST+{i}',
                 created_by=user, batch=batch, position=i,
             )
-        with patch('openedx_bulk_rerun_ext.tasks.run_course_rerun.apply_async') as mock_async:
+        with patch('openedx_bulk_rerun_ext.tasks.run_course_rerun.apply') as mock_apply:
             dispatch_batch_rerun.apply(args=[str(batch.id)])
-        assert mock_async.call_count == 3
+        assert mock_apply.call_count == 3
 
-    def test_countdown_staggered_by_position(self, user, batch):
+    def test_countdown_staggered_by_position(self, user, batch, settings):
+        settings.BULK_RERUN_USE_CELERY = True
         for i in range(2):
             CourseRerunJob.objects.create(
                 source_course_key=SOURCE_KEY,
@@ -415,9 +498,9 @@ class TestDispatchBatchRerun:
             target_course_key='course-v1:ORG+TEST+1',
             created_by=user, batch=batch, position=1,
         )
-        with patch('openedx_bulk_rerun_ext.tasks.run_course_rerun.apply_async') as mock_async:
+        with patch('openedx_bulk_rerun_ext.tasks.run_course_rerun.apply') as mock_apply:
             dispatch_batch_rerun.apply(args=[str(batch.id)])
-        assert mock_async.call_count == 1
+        assert mock_apply.call_count == 1
 
 
 # ── Phase 3: apply_course_settings — no settings row ─────────────────────────
@@ -497,6 +580,39 @@ class TestApplyCourseSettingsWithSettings:
         apply_course_settings.apply(args=[str(batch_job.id)])
         batch_job.batch.refresh_from_db()
         assert batch_job.batch.status == BulkRerunBatch.Status.SUCCEEDED
+
+    def test_apply_gating_called_when_mode_is_not_disabled(self, batch_job, user):
+        """apply_gating is invoked when gating_mode is not 'disabled'."""
+        now = timezone.now()
+        CourseRerunSettings.objects.create(
+            batch=batch_job.batch,
+            course_start=now,
+            course_end=now.replace(year=now.year + 1),
+            enrollment_start=now,
+            enrollment_end=now.replace(year=now.year + 1),
+            gating_mode='copy',
+            remove_provisioner_after=False,
+        )
+        batch_job.status = CourseRerunJob.Status.RUNNING
+        batch_job.save()
+        apply_course_settings.apply(args=[str(batch_job.id)])
+        assert batch_job.logs.filter(message__icontains='gating').exists()
+
+    def test_remove_provisioner_called_when_flag_true(self, batch_job, user):
+        """remove_provisioner is invoked when remove_provisioner_after is True."""
+        now = timezone.now()
+        CourseRerunSettings.objects.create(
+            batch=batch_job.batch,
+            course_start=now,
+            course_end=now.replace(year=now.year + 1),
+            enrollment_start=now,
+            enrollment_end=now.replace(year=now.year + 1),
+            remove_provisioner_after=True,
+        )
+        batch_job.status = CourseRerunJob.Status.RUNNING
+        batch_job.save()
+        apply_course_settings.apply(args=[str(batch_job.id)])
+        assert batch_job.logs.filter(message__icontains='Provisioner').exists()
 
 
 # ── Phase 3: apply_course_settings — dry-run with settings ───────────────────

@@ -6,17 +6,16 @@ from django.conf import settings as django_settings
 from django.utils import timezone
 
 
-def _dispatch_task(task, *args):
+def _dispatch_task(task, *args, **kwargs):
     """
-    Dispatch a Celery task either to the broker (when BULK_RERUN_USE_CELERY=True)
-    or run it synchronously in the current thread (default).
+    Dispatch a Celery task to the broker or run it synchronously in the current thread.
 
     Thread mode requires no separate Celery worker and is the default for
     development.  Set BULK_RERUN_USE_CELERY = True in Django settings to
     dispatch to a running CMS Celery worker instead.
     """
     if getattr(django_settings, 'BULK_RERUN_USE_CELERY', False):
-        task.apply_async(args=list(args))
+        task.apply_async(args=list(args), **kwargs)
     else:
         task.apply(args=list(args))
 
@@ -84,11 +83,11 @@ def dispatch_batch_rerun(batch_id):
 
     jobs = batch.jobs.filter(status='pending').order_by('position')
     for job in jobs:
-        _dispatch_task(run_course_rerun, str(job.id))
+        _dispatch_task(run_course_rerun, str(job.id), countdown=job.position * 2)
 
 
 @shared_task(bind=True, max_retries=3, default_retry_delay=30)
-def run_course_rerun(self, job_id):
+def run_course_rerun(self, job_id):  # pylint: disable=too-many-statements
     """
     Execute a single course rerun by delegating to edx-platform's rerun_course task.
 
@@ -123,7 +122,7 @@ def run_course_rerun(self, job_id):
     job.save(update_fields=update_fields)
 
     try:
-        # pylint: disable=import-outside-toplevel,import-error
+        # pylint: disable=import-outside-toplevel
         from cms.djangoapps.contentstore.tasks import rerun_course
         from common.djangoapps.course_action_state.models import CourseRerunState
         from opaque_keys.edx.keys import CourseKey
@@ -166,11 +165,12 @@ def run_course_rerun(self, job_id):
             # Fetch the source course display name and strip template prefixes
             # ("Demo: ", "DEV: ", "Template: ") so the cloned course has a clean title.
             # rerun_course expects fields as a JSON string, not a dict.
-            import re    # pylint: disable=import-outside-toplevel
             import json  # pylint: disable=import-outside-toplevel
+            import re  # pylint: disable=import-outside-toplevel
             fields_json = None
             try:
-                from xmodule.modulestore.django import modulestore as get_store  # pylint: disable=import-outside-toplevel,import-error
+                # pylint: disable-next=import-outside-toplevel,import-error
+                from xmodule.modulestore.django import modulestore as get_store
                 src_course = get_store().get_course(source_key)
                 if src_course:
                     raw_name = src_course.display_name or ''
@@ -198,7 +198,8 @@ def run_course_rerun(self, job_id):
                 # an existing course — skip creation and proceed to settings.
                 already_exists = False
                 try:
-                    from xmodule.modulestore.django import modulestore as get_store  # pylint: disable=import-outside-toplevel,import-error
+                    # pylint: disable-next=import-outside-toplevel,import-error
+                    from xmodule.modulestore.django import modulestore as get_store
                     already_exists = get_store().has_course(target_key)
                 except Exception:  # pylint: disable=broad-exception-caught
                     pass
@@ -219,6 +220,7 @@ def run_course_rerun(self, job_id):
 
     except Exception as exc:  # pylint: disable=broad-exception-caught
         from django.db.utils import IntegrityError  # pylint: disable=import-outside-toplevel
+
         # A duplicate-entry IntegrityError for the target course key means the
         # course (or its org association) was already created — e.g. by a
         # previous retry that partially succeeded or by a concurrent job.
@@ -290,6 +292,7 @@ def apply_course_settings(self, job_id):
             apply_team_access,
             enroll_provisioner,
             ensure_org_course_association,
+            publish_course,
             remove_provisioner,
         )
 
@@ -312,6 +315,7 @@ def apply_course_settings(self, job_id):
             apply_team_access(job, course_key, s, org_members, job.created_by)
             if s.gating_mode != 'disabled':
                 apply_gating(job, course_key, s)
+            publish_course(job, course_key)
             if s.remove_provisioner_after:
                 remove_provisioner(job, course_key, job.created_by)
             _log(job.id, 'ok', '✓ Course creation complete.')

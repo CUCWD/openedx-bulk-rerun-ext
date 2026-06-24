@@ -17,8 +17,7 @@ def _log(job_id, level, message):
 
 def ensure_org_course_association(job, course_key):
     """
-    Guarantee that an OrganizationCourse row exists for the target course using
-    the target course's own org.
+    Guarantee the target course has an OrganizationCourse row scoped to its own org.
 
     rerun_course's clone_instance may record the source org rather than the
     target org, or may leave no association at all when creation is skipped.
@@ -26,7 +25,8 @@ def ensure_org_course_association(job, course_key):
     (certificates, team access) always see a correct org-course link.
     """
     try:
-        from organizations.models import Organization, OrganizationCourse  # pylint: disable=import-outside-toplevel
+        # pylint: disable=import-outside-toplevel,import-error
+        from organizations.models import Organization, OrganizationCourse
         target_org = Organization.objects.filter(short_name=course_key.org).first()
         if target_org:
             removed, _ = OrganizationCourse.objects.filter(
@@ -88,8 +88,7 @@ def apply_scheduling(job, course_key, settings):
 
 def apply_certificates(job, course_key, settings):
     """
-    Set the course enrolment mode, activate a certificate configuration, and
-    enable self-generated certificates.
+    Set the course enrolment mode, activate a certificate configuration, and enable self-generated certificates.
 
     Steps:
       1. Update or create the CourseMode row for the target course.
@@ -250,9 +249,10 @@ def apply_gating(job, course_key, settings):
     Apply lesson gating rules to the target course.
 
     Modes:
-      copy   — copy prerequisite rules from the source course.
-      custom — chain every subsection as a prerequisite to the next,
-               using settings.gating_min_score and gating_min_completion.
+
+    * ``copy`` -- copy prerequisite rules from the source course.
+    * ``custom`` -- chain every subsection as a prerequisite to the next,
+      using settings.gating_min_score and gating_min_completion.
     """
     _log(job.id, 'info', f'Applying lesson gating: mode={settings.gating_mode}')
     try:
@@ -322,7 +322,7 @@ def _apply_custom_gating(gating_api, course_key, min_score, min_completion, user
         each with the configured min_score and min_completion thresholds.
     Subsection gating is enabled on the course XBlock if not already set.
     """
-    from xmodule.modulestore.django import modulestore  # pylint: disable=import-outside-toplevel
+    from xmodule.modulestore.django import modulestore  # pylint: disable=import-outside-toplevel,import-error
 
     # Fetch the course with depth=2 so chapter and subsection children are loaded.
     store = modulestore()
@@ -362,10 +362,63 @@ def _apply_custom_gating(gating_api, course_key, min_score, min_completion, user
         )
 
 
+def publish_course(job, course_key):
+    """
+    Publish draft course content and synchronously populate CourseOutlineData for the LMS.
+
+    rerun_course clones content into draft state in the Split modulestore.
+    Without an explicit publish the LMS raises CourseOutlineData.DoesNotExist
+    and the course-home API returns HTTP 500 for any enrolled learner.
+
+    Two steps are required:
+      1. store.publish() promotes the draft blocks to published state and fires
+         the COURSE_PUBLISHED signal.  The signal handler enqueues
+         update_outline_from_modulestore_task as a Celery task, but that task
+         will never execute unless a Celery worker is running and consuming the
+         correct queue.  We therefore perform step 2 explicitly.
+      2. update_outline_from_modulestore() is called synchronously so that
+         CourseOutlineData is guaranteed to be populated before this applicator
+         returns, regardless of whether a Celery worker is available.
+    """
+    _log(job.id, 'info', f'Publishing course content for {course_key}...')
+
+    # Step 1: publish draft content.
+    # Import-guard is separate from the publish call so that an ImportError raised
+    # by a COURSE_PUBLISHED signal handler (which does its own lazy imports) is not
+    # misreported as "platform not available".
+    try:
+        from xmodule.modulestore.django import modulestore  # pylint: disable=import-outside-toplevel
+    except ImportError:
+        _log(job.id, 'warn', 'Course publish skipped: platform not available.')
+    else:
+        try:
+            store = modulestore()
+            # make_usage_key('course', 'course') returns the root course block key.
+            # Publishing the root in the Split modulestore cascades to all child blocks.
+            course_usage_key = course_key.make_usage_key('course', 'course')
+            store.publish(course_usage_key, job.created_by.id)
+            _log(job.id, 'ok', f'✓ Course published: {course_key}.')
+        except Exception as exc:  # pylint: disable=broad-exception-caught
+            _log(job.id, 'warn', f'Course publish failed (non-fatal): {exc}')
+
+    # Step 2: synchronously populate CourseOutlineData so the LMS course-home API
+    # works without depending on a Celery worker processing the COURSE_PUBLISHED signal.
+    try:
+        # pylint: disable=import-outside-toplevel
+        from cms.djangoapps.contentstore.outlines import update_outline_from_modulestore
+    except ImportError:
+        _log(job.id, 'warn', 'Course outline update skipped: platform not available.')
+    else:
+        try:
+            update_outline_from_modulestore(course_key)
+            _log(job.id, 'ok', '✓ Course outline populated for LMS.')
+        except Exception as exc:  # pylint: disable=broad-exception-caught
+            _log(job.id, 'warn', f'Course outline update failed (non-fatal): {exc}')
+
+
 def enroll_provisioner(job, course_key, requesting_user, settings):
     """
-    Enroll the provisioner in the newly created course using the batch-configured
-    course_mode.
+    Enroll the provisioner in the newly created course using the batch-configured course_mode.
 
     Called immediately after course creation so the provisioner has a valid
     enrollment record before any other settings (certificates, team access) are

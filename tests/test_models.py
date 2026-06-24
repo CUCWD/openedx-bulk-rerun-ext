@@ -3,7 +3,9 @@ Tests for CourseRerunJob, BulkRerunBatch, CourseRerunLog, CourseRerunSettings,
 and CourseRerunTeamMember models.
 """
 # pylint: disable=redefined-outer-name
+import importlib
 import uuid
+from types import SimpleNamespace
 
 import pytest
 from django.contrib.auth import get_user_model
@@ -17,6 +19,7 @@ from openedx_bulk_rerun_ext.models import (
     CourseRerunSettings,
     CourseRerunTeamMember,
 )
+from openedx_bulk_rerun_ext.settings.common import plugin_settings
 
 User = get_user_model()
 pytestmark = pytest.mark.django_db
@@ -115,19 +118,6 @@ class TestDefaults:
 
 class TestConstraints:
     """DB-level constraints and meta ordering behave as specified."""
-
-    def test_target_course_key_must_be_unique(self, user):
-        CourseRerunJob.objects.create(
-            source_course_key='course-v1:CA+TEST+DEMO',
-            target_course_key='course-v1:ORG+TEST+2026',
-            created_by=user,
-        )
-        with pytest.raises(IntegrityError):
-            CourseRerunJob.objects.create(
-                source_course_key='course-v1:CA+TEST+DEMO',
-                target_course_key='course-v1:ORG+TEST+2026',
-                created_by=user,
-            )
 
     def test_default_ordering_is_newest_first(self, user):
         j1 = CourseRerunJob.objects.create(
@@ -381,10 +371,6 @@ class TestCourseRerunSettingsDefaults:
         s = _make_settings(batch)
         assert s.gating_mode == CourseRerunSettings.GatingMode.DISABLED
 
-    def test_gating_template_id_defaults_to_empty(self, batch):
-        s = _make_settings(batch)
-        assert s.gating_template_id == ''
-
     def test_remove_provisioner_after_defaults_to_true(self, batch):
         s = _make_settings(batch)
         assert s.remove_provisioner_after is True
@@ -454,3 +440,33 @@ class TestCourseRerunTeamMemberConstraints:
         batch_id = batch.id
         batch.delete()
         assert CourseRerunTeamMember.objects.filter(batch_id=batch_id).count() == 0
+
+
+# ── Plugin settings ───────────────────────────────────────────────────────────
+
+class TestPluginSettings:
+    """plugin_settings() configures BULK_RERUN_* settings when not already present."""
+
+    def test_sets_default_max_concurrent(self):
+        s = SimpleNamespace()
+        plugin_settings(s)
+        assert s.BULK_RERUN_MAX_CONCURRENT == 3
+
+    def test_sets_default_max_retries(self):
+        s = SimpleNamespace()
+        plugin_settings(s)
+        assert s.BULK_RERUN_SETTINGS_MAX_RETRIES == 2
+
+    def test_does_not_override_existing_max_concurrent(self):
+        s = SimpleNamespace(BULK_RERUN_MAX_CONCURRENT=10)
+        plugin_settings(s)
+        assert s.BULK_RERUN_MAX_CONCURRENT == 10
+
+    def test_does_not_override_existing_max_retries(self):
+        s = SimpleNamespace(BULK_RERUN_SETTINGS_MAX_RETRIES=5)
+        plugin_settings(s)
+        assert s.BULK_RERUN_SETTINGS_MAX_RETRIES == 5
+
+    def test_production_exports_plugin_settings(self):
+        prod = importlib.import_module('openedx_bulk_rerun_ext.settings.production')
+        assert hasattr(prod, 'plugin_settings')

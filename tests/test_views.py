@@ -12,6 +12,7 @@ URL patterns under test (ROOT_URLCONF = openedx_bulk_rerun_ext.urls):
 """
 # pylint: disable=redefined-outer-name,unused-argument
 import datetime
+import sys
 import uuid
 from unittest.mock import MagicMock, patch
 
@@ -29,6 +30,16 @@ pytestmark = pytest.mark.django_db
 SOURCE_KEY = 'course-v1:CA+FAA-ACS-AM-IA-ACE+DEMO'
 TARGET_KEY = 'course-v1:AeroTech+FAA-ACS-AM-IA-ACE+2026_2027'
 ALT_TARGET = 'course-v1:SkyLine+FAA-ACS-AM-IA-ACE+2026_2027'
+
+
+class _SyncThread:
+    """Synchronous thread replacement that runs target inline for testing."""
+
+    def __init__(self, target=None, daemon=None, **kw):
+        self._target = target
+
+    def start(self):
+        self._target()
 
 
 # ── Fixtures ──────────────────────────────────────────────────────────────────
@@ -147,7 +158,6 @@ class TestValidateCourseKeysView:
 
     def test_succeeded_job_with_live_course_reports_key_as_existing(self, auth_client, existing_job):
         # If the modulestore confirms the course still exists, it must still be flagged.
-        import sys
         existing_job.status = CourseRerunJob.Status.SUCCEEDED
         existing_job.save()
         mock_store = MagicMock()
@@ -181,6 +191,34 @@ class TestValidateCourseKeysView:
         )
         assert TARGET_KEY in resp.data['existing']
         assert ALT_TARGET not in resp.data['existing']
+
+    def test_pass1_key_not_rechecked_in_store(self, auth_client, existing_job):
+        """A key already confirmed by the DB query is not rechecked against the modulestore."""
+        existing_job.status = CourseRerunJob.Status.PENDING
+        existing_job.save()
+        mock_store = MagicMock()
+        fake_modules = {
+            'xmodule': MagicMock(), 'xmodule.modulestore': MagicMock(),
+            'xmodule.modulestore.django': MagicMock(modulestore=MagicMock(return_value=mock_store)),
+        }
+        with patch.dict(sys.modules, fake_modules):
+            resp = auth_client.post(self.URL, {'keys': [TARGET_KEY]}, format='json')
+        assert TARGET_KEY in resp.data['existing']
+        mock_store.has_course.assert_not_called()
+
+    def test_succeeded_course_not_in_store_not_flagged(self, auth_client, existing_job):
+        """A SUCCEEDED job whose course has since been deleted is not reported as a conflict."""
+        existing_job.status = CourseRerunJob.Status.SUCCEEDED
+        existing_job.save()
+        mock_store = MagicMock()
+        mock_store.has_course.return_value = False
+        fake_modules = {
+            'xmodule': MagicMock(), 'xmodule.modulestore': MagicMock(),
+            'xmodule.modulestore.django': MagicMock(modulestore=MagicMock(return_value=mock_store)),
+        }
+        with patch.dict(sys.modules, fake_modules):
+            resp = auth_client.post(self.URL, {'keys': [TARGET_KEY]}, format='json')
+        assert resp.data['existing'] == []
 
 
 # ── Phase 1: POST /jobs/ ──────────────────────────────────────────────────────
@@ -328,6 +366,71 @@ class TestCourseRerunJobCreate:
             format='json',
         )
         assert resp.data['job_type'] == 'individual'
+
+    def test_source_course_absent_from_store_returns_400(self, auth_client, mock_task):
+        """POST /jobs/ returns 400 when the modulestore reports the source course does not exist."""
+        mock_store = MagicMock()
+        mock_store.has_course.return_value = False
+        fake_modules = {
+            'xmodule': MagicMock(), 'xmodule.modulestore': MagicMock(),
+            'xmodule.modulestore.django': MagicMock(modulestore=MagicMock(return_value=mock_store)),
+        }
+        with patch.dict(sys.modules, fake_modules):
+            resp = auth_client.post(
+                self.URL,
+                {'source_course_key': SOURCE_KEY, 'target_course_key': TARGET_KEY},
+                format='json',
+            )
+        assert resp.status_code == 400
+        assert 'does not exist' in resp.data['error']
+
+    def test_new_org_job_type_skips_org_validation(self, auth_client, mock_task):
+        """job_type=new_org bypasses the target-org registration check."""
+        resp = auth_client.post(
+            self.URL,
+            {
+                'source_course_key': SOURCE_KEY,
+                'target_course_key': TARGET_KEY,
+                'job_type': 'new_org',
+            },
+            format='json',
+        )
+        assert resp.status_code == 201
+
+    def test_source_course_in_store_allows_job_creation(self, auth_client, mock_task):
+        """When the modulestore confirms the source course exists, job creation proceeds."""
+        mock_store = MagicMock()
+        mock_store.has_course.return_value = True
+        fake_modules = {
+            'xmodule': MagicMock(), 'xmodule.modulestore': MagicMock(),
+            'xmodule.modulestore.django': MagicMock(modulestore=MagicMock(return_value=mock_store)),
+        }
+        with patch.dict(sys.modules, fake_modules):
+            resp = auth_client.post(
+                self.URL,
+                {'source_course_key': SOURCE_KEY, 'target_course_key': TARGET_KEY, 'job_type': 'new_org'},
+                format='json',
+            )
+        assert resp.status_code == 201
+
+    def test_unregistered_org_returns_400(self, auth_client, mock_task):
+        """POST /jobs/ returns 400 when the target org is not registered on the platform."""
+        _ExcClass = type('InvalidOrganizationException', (Exception,), {})
+        fake_modules = {
+            'organizations': MagicMock(),
+            'organizations.api': MagicMock(
+                get_organization_by_short_name=MagicMock(side_effect=_ExcClass()),
+            ),
+            'organizations.exceptions': MagicMock(InvalidOrganizationException=_ExcClass),
+        }
+        with patch.dict(sys.modules, fake_modules):
+            resp = auth_client.post(
+                self.URL,
+                {'source_course_key': SOURCE_KEY, 'target_course_key': TARGET_KEY},
+                format='json',
+            )
+        assert resp.status_code == 400
+        assert 'not registered' in resp.data['error']
 
 
 # ── Phase 1: GET /jobs/ ───────────────────────────────────────────────────────
@@ -490,8 +593,30 @@ class TestBulkRerunBatchCreate:
         assert CourseRerunJob.objects.filter(target_course_key=TARGET_KEY).exists()
 
     def test_fan_out_task_dispatched(self, auth_client, mock_batch_task):
-        auth_client.post(self.URL, self._payload(), format='json')
-        mock_batch_task.delay.assert_called_once()
+        with patch('openedx_bulk_rerun_ext.views.transaction.on_commit', side_effect=lambda f: f()), \
+             patch('openedx_bulk_rerun_ext.views.threading.Thread', _SyncThread):
+            auth_client.post(self.URL, self._payload(), format='json')
+        mock_batch_task.apply.assert_called_once()
+
+    def test_duplicate_org_email_team_member_deduped(self, auth_client, mock_batch_task):
+        """Only the first entry for a given (org, email) pair is persisted."""
+        payload = self._payload(team_members=[
+            {'email': 'inst@example.com', 'org': 'AeroTech', 'studio_role': 'admin', 'discussion_role': 'none'},
+            {'email': 'inst@example.com', 'org': 'AeroTech', 'studio_role': 'staff', 'discussion_role': 'none'},
+        ])
+        auth_client.post(self.URL, payload, format='json')
+        batch = BulkRerunBatch.objects.get()
+        assert batch.team_members.filter(email='inst@example.com', org='AeroTech').count() == 1
+
+    def test_dispatch_exception_marks_batch_failed(self, auth_client, mock_batch_task):
+        """When _dispatch_task raises inside the dispatch thread, the batch is marked FAILED."""
+        mock_batch_task.apply.side_effect = RuntimeError('celery crashed')
+        with patch('openedx_bulk_rerun_ext.views.transaction.on_commit', side_effect=lambda f: f()), \
+             patch('openedx_bulk_rerun_ext.views.threading.Thread', _SyncThread):
+            resp = auth_client.post(self.URL, self._payload(), format='json')
+        batch_id = resp.data['batch_id']
+        batch = BulkRerunBatch.objects.get(id=batch_id)
+        assert batch.status == BulkRerunBatch.Status.FAILED
 
     def test_invalid_course_key_returns_400(self, auth_client, mock_batch_task):
         payload = self._payload()
@@ -530,8 +655,25 @@ class TestBulkRerunBatchCreate:
         resp = auth_client.post(self.URL, self._payload(), format='json')
         assert resp.status_code == 202
 
+    def test_succeeded_job_with_store_available_but_course_gone_allows_new_batch(
+        self, auth_client, mock_batch_task, existing_job
+    ):
+        existing_job.status = CourseRerunJob.Status.SUCCEEDED
+        existing_job.save()
+        mock_store = MagicMock()
+        mock_store.has_course.return_value = False  # course was deleted
+        fake_django_mod = MagicMock()
+        fake_django_mod.modulestore = MagicMock(return_value=mock_store)
+        fake_modules = {
+            'xmodule': MagicMock(),
+            'xmodule.modulestore': MagicMock(),
+            'xmodule.modulestore.django': fake_django_mod,
+        }
+        with patch.dict(sys.modules, fake_modules):
+            resp = auth_client.post(self.URL, self._payload(), format='json')
+        assert resp.status_code == 202
+
     def test_succeeded_job_with_live_course_blocks_new_batch(self, auth_client, mock_batch_task, existing_job):
-        import sys
         existing_job.status = CourseRerunJob.Status.SUCCEEDED
         existing_job.save()
         mock_store = MagicMock()
@@ -571,6 +713,43 @@ class TestBulkRerunBatchCreate:
         assert resp.status_code == 202
         batch = BulkRerunBatch.objects.get(id=resp.data['batch_id'])
         assert batch.prog_id == 'faa'
+
+
+# ── Phase 2: GET /batches/ ───────────────────────────────────────────────────
+
+class TestBulkRerunBatchList:
+    """GET /batches/ — list the caller's batches, with optional status filter."""
+
+    URL = '/batches/'
+
+    def test_requires_authentication(self, anon_client):
+        resp = anon_client.get(self.URL)
+        assert resp.status_code == 401
+
+    def test_returns_empty_list_when_no_batches(self, auth_client):
+        resp = auth_client.get(self.URL)
+        assert resp.status_code == 200
+        assert resp.data == []
+
+    def test_returns_own_batches(self, auth_client, user):
+        BulkRerunBatch.objects.create(
+            created_by=user,
+            mode=BulkRerunBatch.Mode.INDIVIDUAL,
+            target_run='2026_2027',
+        )
+        resp = auth_client.get(self.URL)
+        assert len(resp.data) == 1
+
+    def test_status_filter_applied(self, auth_client, user):
+        batch = BulkRerunBatch.objects.create(
+            created_by=user,
+            mode=BulkRerunBatch.Mode.INDIVIDUAL,
+            target_run='2026_2027',
+        )
+        batch.status = BulkRerunBatch.Status.RUNNING
+        batch.save()
+        assert auth_client.get(self.URL, {'status': 'pending'}).data == []
+        assert len(auth_client.get(self.URL, {'status': 'running'}).data) == 1
 
 
 # ── Phase 2: GET /batches/<uuid>/ ─────────────────────────────────────────────
@@ -629,6 +808,13 @@ class TestBulkRerunBatchDetail:
         )
         resp = auth_client.get(self._url(other_batch.id))
         assert resp.status_code == 404
+
+    def test_completed_batch_returns_phase_4(self, auth_client, existing_batch):
+        """A batch in a terminal status reports phase=4 in the serialized response."""
+        existing_batch.status = BulkRerunBatch.Status.SUCCEEDED
+        existing_batch.save()
+        resp = auth_client.get(self._url(existing_batch.id))
+        assert resp.data['phase'] == 4
 
     def test_elapsed_seconds_present_for_completed_job(self, auth_client, user, existing_batch):
         j = CourseRerunJob.objects.create(
@@ -761,6 +947,13 @@ class TestBulkRerunBatchCreatePhase3(TestBulkRerunBatchCreate):
         resp = auth_client.post(self.URL, self._payload(settings=bad_settings), format='json')
         assert resp.status_code == 400
 
+    def test_enrollment_end_after_course_end_returns_400(self, auth_client, mock_batch_task):
+        """Settings where enrollment_end is after course_end fail validation."""
+        bad_settings = dict(self._DEFAULT_SETTINGS)
+        bad_settings['enrollment_end'] = '2027-01-01T00:00:00Z'
+        resp = auth_client.post(self.URL, self._payload(settings=bad_settings), format='json')
+        assert resp.status_code == 400
+
 
 # ── Phase 3: GET /batches/<uuid>/ — settings_applied_count ───────────────────
 
@@ -800,3 +993,81 @@ class TestBulkRerunBatchDetailPhase3:
         )
         resp = auth_client.get(self._url(existing_batch.id))
         assert 'settings_applied' in resp.data['jobs'][0]
+
+
+# ── POST /batches/<uuid>/cancel/ ──────────────────────────────────────────────
+
+class TestBulkRerunBatchCancel:
+    """POST /batches/<uuid>/cancel/ — cancel a non-terminal batch."""
+
+    def _url(self, batch_id):
+        return reverse('bulk_rerun:batches-cancel', kwargs={'batch_id': batch_id})
+
+    @pytest.fixture
+    def running_batch(self, user):
+        """A RUNNING batch with one PENDING and one RUNNING job."""
+        batch = BulkRerunBatch.objects.create(
+            created_by=user,
+            mode=BulkRerunBatch.Mode.INDIVIDUAL,
+            target_run='2026_2027',
+            status=BulkRerunBatch.Status.RUNNING,
+        )
+        CourseRerunJob.objects.create(
+            source_course_key=SOURCE_KEY,
+            target_course_key=TARGET_KEY,
+            created_by=user,
+            batch=batch,
+            status=CourseRerunJob.Status.PENDING,
+        )
+        CourseRerunJob.objects.create(
+            source_course_key=SOURCE_KEY,
+            target_course_key=ALT_TARGET,
+            created_by=user,
+            batch=batch,
+            status=CourseRerunJob.Status.RUNNING,
+        )
+        return batch
+
+    def test_requires_authentication(self, anon_client, running_batch):
+        resp = anon_client.post(self._url(running_batch.id))
+        assert resp.status_code == 401
+
+    def test_nonexistent_batch_returns_404(self, auth_client):
+        resp = auth_client.post(self._url(uuid.uuid4()))
+        assert resp.status_code == 404
+
+    def test_other_users_batch_returns_404(self, auth_client, other_user):
+        other_batch = BulkRerunBatch.objects.create(
+            created_by=other_user,
+            mode=BulkRerunBatch.Mode.INDIVIDUAL,
+            target_run='2026_2027',
+            status=BulkRerunBatch.Status.RUNNING,
+        )
+        resp = auth_client.post(self._url(other_batch.id))
+        assert resp.status_code == 404
+
+    def test_terminal_batch_returns_400(self, auth_client, user):
+        batch = BulkRerunBatch.objects.create(
+            created_by=user,
+            mode=BulkRerunBatch.Mode.INDIVIDUAL,
+            target_run='2026_2027',
+            status=BulkRerunBatch.Status.SUCCEEDED,
+        )
+        resp = auth_client.post(self._url(batch.id))
+        assert resp.status_code == 400
+        assert 'terminal' in resp.data['error']
+
+    def test_cancel_sets_batch_status_failed(self, auth_client, running_batch):
+        auth_client.post(self._url(running_batch.id))
+        running_batch.refresh_from_db()
+        assert running_batch.status == BulkRerunBatch.Status.FAILED
+
+    def test_cancel_returns_cancelled_jobs_count(self, auth_client, running_batch):
+        resp = auth_client.post(self._url(running_batch.id))
+        assert resp.status_code == 200
+        assert resp.data['cancelled_jobs'] == 2
+
+    def test_pending_and_running_jobs_marked_failed(self, auth_client, running_batch):
+        auth_client.post(self._url(running_batch.id))
+        statuses = list(running_batch.jobs.values_list('status', flat=True))
+        assert all(s == CourseRerunJob.Status.FAILED for s in statuses)

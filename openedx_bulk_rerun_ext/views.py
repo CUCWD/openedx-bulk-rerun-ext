@@ -314,6 +314,30 @@ class BulkRerunBatchListCreateView(APIView):
             ).values_list('target_course_key', flat=True)
         )
 
+        # Pass 2: for target keys with a SUCCEEDED job, check whether the course
+        # still exists in the modulestore.  A live course means the slot is taken —
+        # block the submission so the operator is aware before proceeding.
+        candidate_keys = [k for k in target_keys if k not in blocked]
+        if candidate_keys:
+            succeeded_keys = set(
+                CourseRerunJob.objects.filter(
+                    target_course_key__in=candidate_keys,
+                    status=CourseRerunJob.Status.SUCCEEDED,
+                ).exclude(
+                    batch__is_dry_run=True,
+                ).values_list('target_course_key', flat=True)
+            )
+            if succeeded_keys:
+                try:
+                    # pylint: disable=import-outside-toplevel,import-error
+                    from xmodule.modulestore.django import modulestore
+                    store = modulestore()
+                    for key_str in succeeded_keys:
+                        if store.has_course(CourseKey.from_string(key_str)):
+                            blocked.add(key_str)
+                except Exception:  # pylint: disable=broad-exception-caught
+                    pass
+
         if blocked:
             return Response(
                 {'error': 'Active jobs already exist for these target keys', 'keys': sorted(blocked)},
@@ -365,7 +389,7 @@ class BulkRerunBatchListCreateView(APIView):
             seen.add((org, email))
             CourseRerunTeamMember.objects.create(batch=batch, **member)
 
-        from .tasks import dispatch_batch_rerun, _dispatch_task  # pylint: disable=import-outside-toplevel
+        from .tasks import _dispatch_task, dispatch_batch_rerun  # pylint: disable=import-outside-toplevel
 
         log = logging.getLogger(__name__)
         batch_id_str = str(batch.id)
@@ -383,7 +407,7 @@ class BulkRerunBatchListCreateView(APIView):
                 from .models import BulkRerunBatch as _Batch  # pylint: disable=import-outside-toplevel
                 try:
                     _Batch.objects.filter(id=batch_id_str).update(status=_Batch.Status.FAILED)
-                except Exception:  # pylint: disable=broad-exception-caught
+                except Exception:  # pragma: no cover  # pylint: disable=broad-exception-caught
                     pass
             finally:
                 close_old_connections()

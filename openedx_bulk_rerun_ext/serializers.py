@@ -233,6 +233,8 @@ class BulkRerunBatchSummarySerializer(serializers.ModelSerializer):
     created_by_username = serializers.CharField(source='created_by.username', read_only=True)
 
     class Meta:
+        """Expose summary fields for the batch list endpoint; excludes nested jobs and logs."""
+
         model = BulkRerunBatch
         fields = [
             'id', 'status', 'mode', 'is_dry_run', 'target_run', 'prog_id',

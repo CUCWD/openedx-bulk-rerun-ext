@@ -13,9 +13,10 @@ from unittest.mock import MagicMock, patch
 import pytest
 from django.contrib.auth import get_user_model
 from django.utils import timezone
-from opaque_keys.edx.keys import CourseKey
+from opaque_keys.edx.keys import CourseKey, UsageKey
 
 from openedx_bulk_rerun_ext.applicators import (
+    _apply_custom_gating,
     _apply_discussion_role,
     _copy_gating_rules,
     apply_certificates,
@@ -23,6 +24,8 @@ from openedx_bulk_rerun_ext.applicators import (
     apply_scheduling,
     apply_team_access,
     enroll_provisioner,
+    ensure_org_course_association,
+    publish_course,
     remove_provisioner,
 )
 from openedx_bulk_rerun_ext.models import BulkRerunBatch, CourseRerunJob, CourseRerunSettings, CourseRerunTeamMember
@@ -49,6 +52,8 @@ def mock_platform_imports():
     mock_store = MagicMock()
     mock_store.get_course.return_value = mock_course
 
+    update_outline = MagicMock()
+
     m = SimpleNamespace(
         CourseDetails=MagicMock(),
         CourseMode=MagicMock(),
@@ -62,9 +67,17 @@ def mock_platform_imports():
         Role=MagicMock(),
         seed_permissions_roles=MagicMock(),
         gating_api=MagicMock(),
+        update_outline=update_outline,
         modulestore=MagicMock(return_value=mock_store),
         mock_store=mock_store,
         mock_course=mock_course,
+        Organization=MagicMock(),
+        OrganizationCourse=MagicMock(
+            **{
+                'objects.filter.return_value.exclude.return_value.delete.return_value': (0, {}),
+                'objects.get_or_create.return_value': (MagicMock(), False),
+            }
+        ),
     )
     modules = {
         'openedx': MagicMock(),
@@ -72,6 +85,9 @@ def mock_platform_imports():
         'openedx.core.djangoapps': MagicMock(),
         'openedx.core.djangoapps.models': MagicMock(),
         'openedx.core.djangoapps.models.course_details': MagicMock(CourseDetails=m.CourseDetails),
+        'cms.djangoapps.contentstore.outlines': MagicMock(
+            update_outline_from_modulestore=update_outline,
+        ),
         'openedx.core.lib': MagicMock(),
         'openedx.core.lib.gating': MagicMock(api=m.gating_api),
         'lms': MagicMock(),
@@ -102,6 +118,11 @@ def mock_platform_imports():
         'xmodule': MagicMock(),
         'xmodule.modulestore': MagicMock(),
         'xmodule.modulestore.django': MagicMock(modulestore=m.modulestore),
+        'organizations': MagicMock(),
+        'organizations.models': MagicMock(
+            Organization=m.Organization,
+            OrganizationCourse=m.OrganizationCourse,
+        ),
     }
     with patch.dict(sys.modules, modules):
         yield m
@@ -156,6 +177,41 @@ def settings_obj(batch):
 @pytest.fixture
 def member_user():
     return User.objects.create_user(username='member', email='member@example.com', password='pw')
+
+
+# ── ensure_org_course_association ─────────────────────────────────────────────
+
+class TestEnsureOrgCourseAssociation:
+    """ensure_org_course_association creates/fixes the OrganizationCourse row."""
+
+    def test_import_error_logs_warning(self, job):
+        """When organizations.models is unavailable the function logs a warning and continues."""
+        with patch.dict(sys.modules, {'organizations.models': None}):
+            ensure_org_course_association(job, COURSE_KEY)
+        assert job.logs.filter(level='warn', message__icontains='non-fatal').exists()
+
+    def test_org_not_found_skips_association_ops(self, job, mock_platform_imports):
+        """When the target org does not exist in the DB, no row is created or deleted."""
+        mock_platform_imports.Organization.objects.filter.return_value.first.return_value = None
+        ensure_org_course_association(job, COURSE_KEY)
+        mock_platform_imports.OrganizationCourse.objects.get_or_create.assert_not_called()
+
+    def test_stale_rows_removed_and_new_association_created(self, job, mock_platform_imports):
+        """Stale OrganizationCourse rows are purged and a fresh one is created."""
+        mock_platform_imports.Organization.objects.filter.return_value.first.return_value = MagicMock()
+        oc = mock_platform_imports.OrganizationCourse
+        oc.objects.filter.return_value.exclude.return_value.delete.return_value = (1, {})
+        mock_platform_imports.OrganizationCourse.objects.get_or_create.return_value = (MagicMock(), True)
+        ensure_org_course_association(job, COURSE_KEY)
+        assert job.logs.filter(level='info', message__icontains='Removed 1 stale').exists()
+        assert job.logs.filter(level='info', message__icontains='Created org-course').exists()
+
+    def test_existing_association_not_logged_as_created(self, job, mock_platform_imports):
+        """When the OrganizationCourse row already exists, no 'created' log is written."""
+        mock_platform_imports.Organization.objects.filter.return_value.first.return_value = MagicMock()
+        mock_platform_imports.OrganizationCourse.objects.get_or_create.return_value = (MagicMock(), False)
+        ensure_org_course_association(job, COURSE_KEY)
+        assert not job.logs.filter(level='info', message__icontains='Created').exists()
 
 
 # ── apply_scheduling ──────────────────────────────────────────────────────────
@@ -390,6 +446,15 @@ class TestApplyTeamAccess:
             apply_team_access(job, COURSE_KEY, settings_obj, [], user)
         assert job.logs.filter(level='warn', message__icontains='Team access skipped').exists()
 
+    def test_unknown_studio_role_skips_role_assignment(
+        self, job, settings_obj, user, batch, member_user, mock_platform_imports,
+    ):
+        """A studio_role that matches no known role silently skips add_instructor/add_users."""
+        member = self._make_member(batch, member_user.email, 'observer')
+        apply_team_access(job, COURSE_KEY, settings_obj, [member], user)
+        mock_platform_imports.add_instructor.assert_not_called()
+        mock_platform_imports.auth.add_users.assert_not_called()
+
 
 # ── _apply_discussion_role ────────────────────────────────────────────────────
 
@@ -479,6 +544,29 @@ class TestApplyGating:
             apply_gating(job, COURSE_KEY, settings_obj)
         assert job.logs.filter(level='warn', message__icontains='Lesson gating skipped').exists()
 
+    def test_disabled_mode_does_not_call_gating_api(self, job, settings_obj, mock_platform_imports):
+        """gating_mode='disabled' skips all gating API calls entirely."""
+        settings_obj.gating_mode = 'disabled'
+        settings_obj.save()
+        apply_gating(job, COURSE_KEY, settings_obj)
+        mock_platform_imports.gating_api.get_prerequisites.assert_not_called()
+        mock_platform_imports.gating_api.find_gating_milestones.assert_not_called()
+
+    def test_custom_mode_calls_apply_custom_gating(self, job, settings_obj, mock_platform_imports):
+        """gating_mode='custom' invokes _apply_custom_gating with the configured thresholds."""
+        settings_obj.gating_mode = 'custom'
+        settings_obj.save()
+        with patch('openedx_bulk_rerun_ext.applicators._apply_custom_gating') as mock_custom:
+            apply_gating(job, COURSE_KEY, settings_obj)
+        mock_custom.assert_called_once_with(
+            mock_platform_imports.gating_api,
+            COURSE_KEY,
+            settings_obj.gating_min_score,
+            settings_obj.gating_min_completion,
+            job.created_by.id,
+        )
+        assert job.logs.filter(level='ok', message__icontains='Lesson gating applied').exists()
+
 
 # ── _copy_gating_rules ────────────────────────────────────────────────────────
 
@@ -489,8 +577,8 @@ class TestCopyGatingRules:
         gating_api = mock_platform_imports.gating_api
         source_key = CourseKey.from_string(SOURCE_KEY)
         gating_api.get_prerequisites.return_value = [
-            {'block_key': 'block-v1:ORG+CS+RUN+type@unit+block@aaa'},
-            {'block_key': 'block-v1:ORG+CS+RUN+type@unit+block@bbb'},
+            {'block_usage_key': 'block-v1:ORG+CS+RUN+type@unit+block@aaa'},
+            {'block_usage_key': 'block-v1:ORG+CS+RUN+type@unit+block@bbb'},
         ]
         _copy_gating_rules(gating_api, source_key, COURSE_KEY)
         assert gating_api.add_prerequisite.call_count == 2
@@ -498,13 +586,13 @@ class TestCopyGatingRules:
     def test_add_prerequisite_called_with_target_key(self, mock_platform_imports):
         gating_api = mock_platform_imports.gating_api
         source_key = CourseKey.from_string(SOURCE_KEY)
+        source_usage_key_str = 'block-v1:ORG+CS+RUN+type@unit+block@aaa'
         gating_api.get_prerequisites.return_value = [
-            {'block_key': 'block-v1:ORG+CS+RUN+type@unit+block@aaa'},
+            {'block_usage_key': source_usage_key_str},
         ]
         _copy_gating_rules(gating_api, source_key, COURSE_KEY)
-        gating_api.add_prerequisite.assert_called_once_with(
-            COURSE_KEY, 'block-v1:ORG+CS+RUN+type@unit+block@aaa',
-        )
+        expected_key = UsageKey.from_string(source_usage_key_str).map_into_course(COURSE_KEY)
+        gating_api.add_prerequisite.assert_called_once_with(COURSE_KEY, expected_key)
 
     def test_no_prerequisites_means_no_add_calls(self, mock_platform_imports):
         gating_api = mock_platform_imports.gating_api
@@ -512,6 +600,78 @@ class TestCopyGatingRules:
         gating_api.get_prerequisites.return_value = []
         _copy_gating_rules(gating_api, source_key, COURSE_KEY)
         gating_api.add_prerequisite.assert_not_called()
+
+    def test_milestone_requirements_copied(self, mock_platform_imports):
+        """Step 2: gate assignments are wired up from source to target course."""
+        gating_api = mock_platform_imports.gating_api
+        source_key = CourseKey.from_string(SOURCE_KEY)
+        gated_src = 'block-v1:CA+FAA-ACS-AM-IA-ACE+DEMO+type@sequential+block@gated_unit'
+        prereq_src = 'block-v1:CA+FAA-ACS-AM-IA-ACE+DEMO+type@sequential+block@prereq_unit'
+        gating_api.get_prerequisites.return_value = []
+        gating_api.find_gating_milestones.return_value = [{'content_id': gated_src}]
+        gating_api.get_required_content.return_value = (prereq_src, 80, 50)
+        _copy_gating_rules(gating_api, source_key, COURSE_KEY)
+        expected_gated = UsageKey.from_string(gated_src).map_into_course(COURSE_KEY)
+        expected_prereq = UsageKey.from_string(prereq_src).map_into_course(COURSE_KEY)
+        gating_api.set_required_content.assert_called_once_with(
+            COURSE_KEY, expected_gated, expected_prereq, 80, 50,
+        )
+
+    def test_milestone_with_empty_prereq_is_skipped(self, mock_platform_imports):
+        """When get_required_content returns an empty prereq string, set_required_content is not called."""
+        gating_api = mock_platform_imports.gating_api
+        source_key = CourseKey.from_string(SOURCE_KEY)
+        gated_src = 'block-v1:CA+FAA-ACS-AM-IA-ACE+DEMO+type@sequential+block@gated_unit'
+        gating_api.get_prerequisites.return_value = []
+        gating_api.find_gating_milestones.return_value = [{'content_id': gated_src}]
+        gating_api.get_required_content.return_value = ('', None, None)
+        _copy_gating_rules(gating_api, source_key, COURSE_KEY)
+        gating_api.set_required_content.assert_not_called()
+
+
+# ── publish_course ────────────────────────────────────────────────────────────
+
+class TestPublishCourse:
+    """publish_course publishes the course root block and populates CourseOutlineData."""
+
+    def test_publish_called_on_course_root(self, job, mock_platform_imports):
+        publish_course(job, COURSE_KEY)
+        course_usage_key = COURSE_KEY.make_usage_key('course', 'course')
+        mock_platform_imports.mock_store.publish.assert_called_once_with(
+            course_usage_key, job.created_by.id,
+        )
+
+    def test_publish_ok_log_written(self, job):
+        publish_course(job, COURSE_KEY)
+        assert job.logs.filter(level='ok', message__icontains='Course published').exists()
+
+    def test_publish_import_error_logs_skip(self, job):
+        with patch.dict(sys.modules, {'xmodule.modulestore.django': None}):
+            publish_course(job, COURSE_KEY)
+        assert job.logs.filter(level='warn', message__icontains='Course publish skipped').exists()
+
+    def test_publish_exception_is_non_fatal(self, job, mock_platform_imports):
+        mock_platform_imports.mock_store.publish.side_effect = RuntimeError('publish error')
+        publish_course(job, COURSE_KEY)
+        assert job.logs.filter(level='warn', message__icontains='Course publish failed').exists()
+
+    def test_update_outline_called_with_course_key(self, job, mock_platform_imports):
+        publish_course(job, COURSE_KEY)
+        mock_platform_imports.update_outline.assert_called_once_with(COURSE_KEY)
+
+    def test_outline_ok_log_written(self, job):
+        publish_course(job, COURSE_KEY)
+        assert job.logs.filter(level='ok', message__icontains='Course outline populated').exists()
+
+    def test_outline_import_error_logs_skip(self, job):
+        with patch.dict(sys.modules, {'cms.djangoapps.contentstore.outlines': None}):
+            publish_course(job, COURSE_KEY)
+        assert job.logs.filter(level='warn', message__icontains='Course outline update skipped').exists()
+
+    def test_outline_exception_is_non_fatal(self, job, mock_platform_imports):
+        mock_platform_imports.update_outline.side_effect = RuntimeError('outline error')
+        publish_course(job, COURSE_KEY)
+        assert job.logs.filter(level='warn', message__icontains='Course outline update failed').exists()
 
 
 # ── remove_provisioner ────────────────────────────────────────────────────────
@@ -575,3 +735,73 @@ class TestRemoveProvisioner:
         mock_platform_imports.auth.remove_users.side_effect = PermissionError('denied')
         remove_provisioner(job, COURSE_KEY, user)
         # no exception raised — function returns normally
+
+
+# ── _apply_custom_gating ──────────────────────────────────────────────────────
+
+class TestApplyCustomGating:
+    """_apply_custom_gating chains every subsection as a sequential prerequisite gate."""
+
+    def _make_course(self, mock_platform_imports, subsections_per_chapter, gating_enabled=True):
+        """Return a configured mock course with the given subsection layout."""
+        chapters = []
+        for subs in subsections_per_chapter:
+            chapter = MagicMock()
+            chapter.get_children.return_value = [MagicMock() for _ in range(subs)]
+            chapters.append(chapter)
+        mock_platform_imports.mock_course.get_children.return_value = chapters
+        mock_platform_imports.mock_course.enable_subsection_gating = gating_enabled
+        return mock_platform_imports.mock_course
+
+    def test_single_subsection_returns_early(self, mock_platform_imports):
+        """With fewer than 2 subsections total, no gating is configured."""
+        self._make_course(mock_platform_imports, [1])
+        _apply_custom_gating(mock_platform_imports.gating_api, COURSE_KEY, '80', '100', 1)
+        mock_platform_imports.gating_api.add_prerequisite.assert_not_called()
+
+    def test_gating_flag_enabled_when_not_set(self, mock_platform_imports):
+        """When enable_subsection_gating is False, it is toggled on and the course is saved."""
+        course = self._make_course(mock_platform_imports, [2], gating_enabled=False)
+        _apply_custom_gating(mock_platform_imports.gating_api, COURSE_KEY, '80', '100', 1)
+        assert course.enable_subsection_gating is True
+        mock_platform_imports.mock_store.update_item.assert_called_with(course, 1)
+
+    def test_gating_already_enabled_does_not_update_item(self, mock_platform_imports):
+        """When enable_subsection_gating is already True, update_item is not called for the flag."""
+        self._make_course(mock_platform_imports, [2], gating_enabled=True)
+        mock_platform_imports.mock_store.update_item.reset_mock()
+        _apply_custom_gating(mock_platform_imports.gating_api, COURSE_KEY, '80', '100', 1)
+        mock_platform_imports.mock_store.update_item.assert_not_called()
+
+    def test_all_but_last_marked_as_prerequisites(self, mock_platform_imports):
+        """Every subsection except the last is registered as an available prerequisite."""
+        self._make_course(mock_platform_imports, [3], gating_enabled=True)
+        gating_api = mock_platform_imports.gating_api
+        _apply_custom_gating(gating_api, COURSE_KEY, '80', '100', 1)
+        assert gating_api.add_prerequisite.call_count == 2
+
+    def test_set_required_content_chains_each_subsection(self, mock_platform_imports):
+        """Each subsection is gated behind the immediately preceding one."""
+        self._make_course(mock_platform_imports, [3], gating_enabled=True)
+        gating_api = mock_platform_imports.gating_api
+        _apply_custom_gating(gating_api, COURSE_KEY, '80', '100', 1)
+        assert gating_api.set_required_content.call_count == 2
+
+    def test_set_required_content_passes_thresholds(self, mock_platform_imports):
+        """set_required_content is called with the min_score and min_completion values."""
+        self._make_course(mock_platform_imports, [2], gating_enabled=True)
+        chapter = mock_platform_imports.mock_course.get_children.return_value[0]
+        sub1, sub2 = chapter.get_children.return_value
+        gating_api = mock_platform_imports.gating_api
+        _apply_custom_gating(gating_api, COURSE_KEY, '75', '90', 1)
+        gating_api.set_required_content.assert_called_once_with(
+            COURSE_KEY, sub2.location, sub1.location, '75', '90',
+        )
+
+    def test_subsections_from_multiple_chapters(self, mock_platform_imports):
+        """Subsections across multiple chapters are chained in order."""
+        self._make_course(mock_platform_imports, [2, 2], gating_enabled=True)
+        gating_api = mock_platform_imports.gating_api
+        _apply_custom_gating(gating_api, COURSE_KEY, '80', '100', 1)
+        assert gating_api.add_prerequisite.call_count == 3
+        assert gating_api.set_required_content.call_count == 3
