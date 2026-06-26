@@ -101,23 +101,32 @@ The main entry point — submits a full batch
             "course_mode": "honor"|"audit"|"verified",
             "cert_display": "early_no_info"|"early_with_info"|"end",
             "create_cert": true, "student_gen_cert": true, "cert_on_dashboard": true,
-            "gating_mode": "disabled"|"copy"|"template"|"custom",
-            "gating_template_id": "",
+            "gating_mode": "disabled"|"copy"|"custom",
+            "gating_min_score": "80",
+            "gating_min_completion": "100",
             "remove_provisioner_after": true
         },
         "team_members": [
-            {"email": "...", "studio_role": "admin"|"staff"|"data_researcher", "discussion_role": "discussion_admin"|"moderator"|"none"}
+            {"org": "MyOrg", "email": "...", "studio_role": "admin"|"staff"|"data_researcher", "discussion_role": "discussion_admin"|"moderator"|"none"}
       ]
     }`
     
 - Validates: 1 - 200 courses, no duplicate targets within batch, key validity/source ≠ target per course, scheduling window sanity (`course_start < course_end`, enrollment window inside course window), no active job blocks any target
 - Response: `202  Accepted`  + `{ "batch_id", "status", "total_jobs", "jobs": [{id, target_course_key, status}, ...] }`
 
+`GET /batches/`
+
+List the caller's batches (most recent 100), using the lightweight summary serializer (no nested job logs).
+
+- Query param: `?status=running,pending` — optional comma-separated filter
+- Response (`BulkRerunBatchSummarySerializer`): `id, status, mode, is_dry_run, target_run, prog_id, created_at, completed_at, created_by_username, config_json`
+
 `GET /batches/<uuid:batch_id>/` 
 
 Full batch status — meant to be polled every 2 secs by the UI
 
-- Response (`BulkRerunBatchSerializer`): `id, status, mode, is_dry_run, target_run, prog_id, total_jobs, done_jobs, failed_jobs, settings_applied_count, created_at, completed_at, jobs[]` — each job nested with `id, position, status, settings_applied, source/target_course_key, started_at, completed_at, elapsed_seconds, error_message, logs[]`
+- Response (`BulkRerunBatchSerializer`): `id, status, mode, is_dry_run, target_run, prog_id, total_jobs, done_jobs, failed_jobs, settings_applied_count, phase, created_at, completed_at, jobs[]` — each job nested with `id, position, status, settings_applied, source/target_course_key, started_at, completed_at, elapsed_seconds, error_message, logs[]`
+- `phase` is a derived integer: `1` = pending/running (course creation in progress), `4` = terminal (done — UI stops polling and shows export summary)
 
 `POST /batches/<id>/cancel/`
 
@@ -158,10 +167,12 @@ run_course_rerun          ← calls OpenEdX's rerun_course (the clone)
 apply_course_settings     ← orchestrates applicators in sequence
         │
         ├── ensure_org_course_association()
+        ├── enroll_provisioner()
         ├── apply_scheduling()
         ├── apply_certificates()
         ├── apply_team_access()
         ├── apply_gating()            (only if gating_mode != disabled)
+        ├── publish_course()
         └── remove_provisioner()      (only if remove_provisioner_after=True)
 
 ```
@@ -315,8 +326,9 @@ Stores all operator-configured settings that the applicators apply to every cour
 
 | Field | Type | Description |
 | --- | --- | --- |
-| `gating_mode` | `CharField` | Lesson gating strategy — see `GatingMode` choices |
-| `gating_template_id` | `CharField` | Block key for the gating template; only used when `gating_mode='template'` |
+| `gating_mode` | `CharField` | Lesson gating strategy — see `GatingMode` choices |
+| `gating_min_score` | `CharField` | Minimum score % a learner must achieve on a subsection before the next unlocks; used by `custom` mode (default `"80"`) |
+| `gating_min_completion` | `CharField` | Minimum completion % required before the next subsection unlocks; used by `custom` mode (default `"100"`) |
 
 **Provisioner cleanup**
 
@@ -344,21 +356,21 @@ Stores all operator-configured settings that the applicators apply to every cour
 | --- | --- |
 | `disabled` | No gating applied (default) |
 | `copy` | Copy prerequisite rules from the source course |
-| `template` | Apply a predefined template by `gating_template_id` |
-| `custom` | Not implemented in Phase 3 |
+| `custom` | Chain every subsection as a sequential prerequisite gate, using `gating_min_score` and `gating_min_completion` thresholds |
 
 ### `CourseRerunTeamMember`
 
-One row per person listed in the “Team & Access” step of the batch submission UI. Every member is added to every course created within the batch with their configured Studio and Discussion roles.
+One row per person per org listed in the "Team & Access" step of the batch submission UI. Members are scoped to an organization — during provisioning, only members whose `org` matches the course's org are applied to that course.
 
 **Fields**
 
 | Field | Type | Description |
 | --- | --- | --- |
-| `batch` | `FK → BulkRerunBatch` | The batch this member belongs to; `CASCADE` delete |
-| `email` | `EmailField` | Used to look up the platform `User` at provisioning time |
-| `studio_role` | `CharField` | Studio course team role — see `StudioRole` choices |
-| `discussion_role` | `CharField` | Discussion forum role — see `DiscussionRole` choices |
+| `batch` | `FK → BulkRerunBatch` | The batch this member belongs to; `CASCADE` delete |
+| `org` | `CharField` | Organization short name this member belongs to. Empty string = apply to all orgs (legacy behavior) |
+| `email` | `EmailField` | Used to look up the platform `User` at provisioning time |
+| `studio_role` | `CharField` | Studio course team role — see `StudioRole` choices |
+| `discussion_role` | `CharField` | Discussion forum role — see `DiscussionRole` choices |
 
 **Choice enums**
 
@@ -368,7 +380,9 @@ One row per person listed in the “Team & Access” step of the batch submissio
 
 **Notes**
 
-- If a team member’s email doesn’t exist on the platform at provisioning time, `apply_team_access` logs a warning and skips that member — it does not fail the job
+- Members are uniquely identified by `(batch, org, email)` — the same person can appear on multiple org rosters within a single batch with different org values
+- If a team member's email doesn't exist on the platform at provisioning time, `apply_team_access` logs a warning and skips that member — it does not fail the job
+- Each team member is also enrolled in the course using the batch's configured `course_mode`
 
 ### `CourseRerunLog`
 
@@ -499,9 +513,9 @@ Lesson gating controls whether learner must satisfy a prerequisite before they c
 
 When a course is rerun, its gating rules don’t automatically carry over — they need to be explicitly configured on a new course. The bulk rerun extension handles this as part of the batch settings, giving operators three options:
 
-- Copy form source
-- Apply a template
-- Disabled
+- **Disabled** — no gating applied (default)
+- **Copy from source** — copies both sides of the prerequisite relationship from the source course, translating each subsection's UsageKey into the equivalent block in the new course
+- **Custom** — chains every subsection as a sequential prerequisite gate. Subsection B unlocks only after a learner meets the configured `gating_min_score` and `gating_min_completion` thresholds on Subsection A, and so on through the whole course
 
 ---
 
@@ -539,12 +553,13 @@ Fill in the shared settings that will be applied to every course in the batch:
 - **Scheduling** — set `course_start`, `course_end`, `enrollment_start`, and `enrollment_end`. The enrollment window must fall inside the course window.
 - **Pacing** — choose `instructor` (default) or `self`.
 - **Certificates** — select the course mode (`honor`, `audit`, or `verified`), when certificates are displayed, and whether learners can self-generate them.
-- **Lesson Gating** — choose `disabled` (default), `copy` (inherit rules from the source), or `template` (apply a predefined template by block key).
+- **Lesson Gating** — choose `disabled` (default), `copy` (inherit prerequisite rules from the source course), or `custom` (chain every subsection sequentially using `gating_min_score` and `gating_min_completion` thresholds).
 
 ### 5. Add team members (optional)
 
 In the **Team & Access** step, add any staff who should have access to all new courses. For each person provide:
 
+- Their **org** — the organization short name to scope this member to (e.g. `MyOrg`). Members are only applied to courses whose org matches this value
 - Their **email address** (must already have a platform account)
 - Their **Studio role** — `admin`, `staff`, or `data_researcher`
 - Their **Discussion role** — `discussion_admin`, `moderator`, or `none`
