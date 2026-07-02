@@ -17,6 +17,7 @@ from .models import BulkRerunBatch, CourseRerunJob, CourseRerunLog, CourseRerunS
 from .serializers import (
     BulkRerunBatchCreateSerializer,
     BulkRerunBatchSerializer,
+    BulkRerunBatchStatusSerializer,
     BulkRerunBatchSummarySerializer,
     CourseRerunJobSerializer,
     CourseRerunLogSerializer,
@@ -442,28 +443,37 @@ class BulkRerunBatchDetailView(APIView):
     """
     Return the full status of a batch including per-course job state.
 
-    GET /api/bulk-rerun/batches/<uuid:batch_id>/ — polled every 2 seconds by
-    the UI Track Progress screen.  Returns 404 if the batch does not exist or
-    was not created by the requesting user.
+    GET /api/bulk-rerun/batches/<uuid:batch_id>/ — polled by the UI Track
+    Progress screen.  Returns 404 if the batch does not exist or was not
+    created by the requesting user.
+
+    Supports ``?include_logs=false`` to omit each job's nested log lines,
+    keeping the polling payload constant-size for long-running batches.  The
+    UI polls with include_logs=false and fetches log lines incrementally via
+    CourseRerunJobLogsView; the full (default) response is used for one-shot
+    hydration on page load/refresh and for the history view.
     """
 
     permission_classes = [IsAuthenticated]
 
     def get(self, request, batch_id):
         """Return batch status and the nested job list; 404 if not owned by the caller."""
+        include_logs = request.query_params.get('include_logs', 'true').lower() != 'false'
+
+        # Jobs MUST come back in position order so the UI can match them to
+        # courseItems by index or by target_course_key reliably.
+        # The model's default ordering (-created_at) would return jobs in
+        # reverse creation order, silently assigning wrong logs to wrong courses.
+        # Logs are ordered by created_at via CourseRerunLog.Meta.ordering.
+        jobs_queryset = CourseRerunJob.objects.order_by('position')
+        if include_logs:
+            jobs_queryset = jobs_queryset.prefetch_related(
+                Prefetch('logs', queryset=CourseRerunLog.objects.order_by('created_at'))
+            )
+
         try:
-            # Jobs MUST come back in position order so the UI can match them to
-            # courseItems by index or by target_course_key reliably.
-            # The model's default ordering (-created_at) would return jobs in
-            # reverse creation order, silently assigning wrong logs to wrong courses.
-            # Logs are ordered by created_at via CourseRerunLog.Meta.ordering.
             batch = BulkRerunBatch.objects.prefetch_related(
-                Prefetch(
-                    'jobs',
-                    queryset=CourseRerunJob.objects.order_by('position').prefetch_related(
-                        Prefetch('logs', queryset=CourseRerunLog.objects.order_by('created_at'))
-                    ),
-                )
+                Prefetch('jobs', queryset=jobs_queryset)
             ).get(id=batch_id)
         except BulkRerunBatch.DoesNotExist:
             return Response(status=status.HTTP_404_NOT_FOUND)
@@ -471,7 +481,8 @@ class BulkRerunBatchDetailView(APIView):
         if batch.created_by != request.user:
             return Response(status=status.HTTP_404_NOT_FOUND)
 
-        return Response(BulkRerunBatchSerializer(batch).data)
+        serializer_class = BulkRerunBatchSerializer if include_logs else BulkRerunBatchStatusSerializer
+        return Response(serializer_class(batch).data)
 
 
 class BulkRerunBatchCancelView(APIView):

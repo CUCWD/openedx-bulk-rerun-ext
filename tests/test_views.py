@@ -832,6 +832,33 @@ class TestBulkRerunBatchDetail:
         assert resp.data['jobs'][0]['elapsed_seconds'] is not None
         assert resp.data['jobs'][0]['elapsed_seconds'] >= 5.0
 
+    def test_logs_included_by_default(self, auth_client, user, existing_batch):
+        job = CourseRerunJob.objects.create(
+            source_course_key=SOURCE_KEY,
+            target_course_key=TARGET_KEY,
+            created_by=user,
+            batch=existing_batch,
+        )
+        CourseRerunLog.objects.create(job=job, level='info', message='started')
+        resp = auth_client.get(self._url(existing_batch.id))
+        assert resp.data['jobs'][0]['logs'][0]['message'] == 'started'
+
+    def test_include_logs_false_omits_nested_logs(self, auth_client, user, existing_batch):
+        """?include_logs=false returns job status fields but no logs key."""
+        job = CourseRerunJob.objects.create(
+            source_course_key=SOURCE_KEY,
+            target_course_key=TARGET_KEY,
+            created_by=user,
+            batch=existing_batch,
+        )
+        CourseRerunLog.objects.create(job=job, level='info', message='started')
+        resp = auth_client.get(self._url(existing_batch.id), {'include_logs': 'false'})
+        assert resp.status_code == 200
+        assert 'logs' not in resp.data['jobs'][0]
+        assert resp.data['jobs'][0]['status'] == 'pending'
+        assert resp.data['jobs'][0]['target_course_key'] == TARGET_KEY
+        assert resp.data['total_jobs'] == 1
+
 
 # ── Phase 2: GET /jobs/<uuid>/logs/ ──────────────────────────────────────────
 
