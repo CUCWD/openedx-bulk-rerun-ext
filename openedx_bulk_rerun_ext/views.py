@@ -271,7 +271,9 @@ class BulkRerunBatchListCreateView(APIView):
     """
     List or create bulk rerun batches.
 
-    GET  /api/bulk-rerun/batches/           — lists the caller's batches.
+    GET  /api/bulk-rerun/batches/           — lists ALL users' batches, so the
+         Tracking Progress page shows a shared view of every operator's runs
+         (each entry carries created_by_username for the UI's user filter).
          ?status=running,pending             — optional comma-separated filter.
          Returns the lightweight summary serializer (no nested job logs) so the
          Tracking Progress page can recover in-flight batches on page load or
@@ -287,8 +289,8 @@ class BulkRerunBatchListCreateView(APIView):
     permission_classes = [IsAuthenticated]
 
     def get(self, request):
-        """List the caller's batches; ?status= filters by comma-separated status values."""
-        qs = BulkRerunBatch.objects.filter(created_by=request.user)
+        """List all users' batches; ?status= filters by comma-separated status values."""
+        qs = BulkRerunBatch.objects.all()
         status_param = request.query_params.get('status')
         if status_param:
             qs = qs.filter(status__in=[s.strip() for s in status_param.split(',')])
@@ -444,8 +446,9 @@ class BulkRerunBatchDetailView(APIView):
     Return the full status of a batch including per-course job state.
 
     GET /api/bulk-rerun/batches/<uuid:batch_id>/ — polled by the UI Track
-    Progress screen.  Returns 404 if the batch does not exist or was not
-    created by the requesting user.
+    Progress screen.  Visible to any authenticated user (the tracking page is
+    a shared view of every operator's batches); returns 404 only if the batch
+    does not exist.
 
     Supports ``?include_logs=false`` to omit each job's nested log lines,
     keeping the polling payload constant-size for long-running batches.  The
@@ -457,7 +460,7 @@ class BulkRerunBatchDetailView(APIView):
     permission_classes = [IsAuthenticated]
 
     def get(self, request, batch_id):
-        """Return batch status and the nested job list; 404 if not owned by the caller."""
+        """Return batch status and the nested job list; 404 if the batch does not exist."""
         include_logs = request.query_params.get('include_logs', 'true').lower() != 'false'
 
         # Jobs MUST come back in position order so the UI can match them to
@@ -478,9 +481,6 @@ class BulkRerunBatchDetailView(APIView):
         except BulkRerunBatch.DoesNotExist:
             return Response(status=status.HTTP_404_NOT_FOUND)
 
-        if batch.created_by != request.user:
-            return Response(status=status.HTTP_404_NOT_FOUND)
-
         serializer_class = BulkRerunBatchSerializer if include_logs else BulkRerunBatchStatusSerializer
         return Response(serializer_class(batch).data)
 
@@ -491,8 +491,11 @@ class BulkRerunBatchCancelView(APIView):
 
     POST /api/bulk-rerun/batches/<uuid:batch_id>/cancel/ — marks all
     pending/running jobs as failed and sets the batch status to failed.
+    Any authenticated user may cancel any batch — the tracking page is a
+    shared view, so a cancel button rendered on another operator's batch
+    must work rather than 404.
     Returns 400 if the batch is already in a terminal state.
-    Returns 404 if the batch does not exist or was not created by the caller.
+    Returns 404 if the batch does not exist.
     """
 
     permission_classes = [IsAuthenticated]
@@ -502,9 +505,6 @@ class BulkRerunBatchCancelView(APIView):
         try:
             batch = BulkRerunBatch.objects.get(id=batch_id)
         except BulkRerunBatch.DoesNotExist:
-            return Response(status=status.HTTP_404_NOT_FOUND)
-
-        if batch.created_by != request.user:
             return Response(status=status.HTTP_404_NOT_FOUND)
 
         terminal = {
@@ -541,7 +541,9 @@ class CourseRerunJobLogsView(APIView):
     GET /api/bulk-rerun/jobs/<uuid:job_id>/logs/ — returns all log lines.
     Supports ``?since=<id>`` for incremental polling; only lines with
     id > since are returned, avoiding re-fetching the full history.
-    Returns 404 if the job does not exist or was not created by the caller.
+    Visible to any authenticated user so the shared tracking page can stream
+    logs for batches started by other operators.
+    Returns 404 if the job does not exist.
     """
 
     permission_classes = [IsAuthenticated]
@@ -551,9 +553,6 @@ class CourseRerunJobLogsView(APIView):
         try:
             job = CourseRerunJob.objects.get(id=job_id)
         except CourseRerunJob.DoesNotExist:
-            return Response(status=status.HTTP_404_NOT_FOUND)
-
-        if job.created_by != request.user:
             return Response(status=status.HTTP_404_NOT_FOUND)
 
         logs = job.logs.all()
