@@ -763,7 +763,7 @@ class TestBulkRerunBatchCreate:
 # ── Phase 2: GET /batches/ ───────────────────────────────────────────────────
 
 class TestBulkRerunBatchList:
-    """GET /batches/ — list the caller's batches, with optional status filter."""
+    """GET /batches/ — list all users' batches, with optional status filter."""
 
     URL = '/batches/'
 
@@ -784,6 +784,23 @@ class TestBulkRerunBatchList:
         )
         resp = auth_client.get(self.URL)
         assert len(resp.data) == 1
+
+    def test_returns_other_users_batches(self, auth_client, user, other_user):
+        """The tracking page is a shared view: every operator's batches are listed."""
+        BulkRerunBatch.objects.create(
+            created_by=user,
+            mode=BulkRerunBatch.Mode.INDIVIDUAL,
+            target_run='2026_2027',
+        )
+        BulkRerunBatch.objects.create(
+            created_by=other_user,
+            mode=BulkRerunBatch.Mode.INDIVIDUAL,
+            target_run='2026_2027',
+        )
+        resp = auth_client.get(self.URL)
+        assert len(resp.data) == 2
+        usernames = {b['created_by_username'] for b in resp.data}
+        assert usernames == {user.username, other_user.username}
 
     def test_status_filter_applied(self, auth_client, user):
         batch = BulkRerunBatch.objects.create(
@@ -845,14 +862,16 @@ class TestBulkRerunBatchDetail:
         resp = auth_client.get(self._url(uuid.uuid4()))
         assert resp.status_code == 404
 
-    def test_other_users_batch_returns_404(self, auth_client, other_user):
+    def test_other_users_batch_is_visible(self, auth_client, other_user):
+        """Batch detail is shared across users so the tracking page can poll any batch."""
         other_batch = BulkRerunBatch.objects.create(
             created_by=other_user,
             mode=BulkRerunBatch.Mode.INDIVIDUAL,
             target_run='2026_2027',
         )
         resp = auth_client.get(self._url(other_batch.id))
-        assert resp.status_code == 404
+        assert resp.status_code == 200
+        assert resp.data['id'] == str(other_batch.id)
 
     def test_completed_batch_returns_phase_4(self, auth_client, existing_batch):
         """A batch in a terminal status reports phase=4 in the serialized response."""
@@ -957,14 +976,16 @@ class TestCourseRerunJobLogsView:
         resp = auth_client.get(self._url(uuid.uuid4()))
         assert resp.status_code == 404
 
-    def test_other_users_job_returns_404(self, auth_client, other_user):
+    def test_other_users_job_logs_are_visible(self, auth_client, other_user):
+        """Log lines are shared across users so the tracking page can stream any job."""
         other_job = CourseRerunJob.objects.create(
             source_course_key=SOURCE_KEY,
             target_course_key=TARGET_KEY,
             created_by=other_user,
         )
         resp = auth_client.get(self._url(other_job.id))
-        assert resp.status_code == 404
+        assert resp.status_code == 200
+        assert resp.data['job_id'] == str(other_job.id)
 
 
 # ── Phase 3: POST /batches/ — settings and team members ──────────────────────
@@ -1108,7 +1129,8 @@ class TestBulkRerunBatchCancel:
         resp = auth_client.post(self._url(uuid.uuid4()))
         assert resp.status_code == 404
 
-    def test_other_users_batch_returns_404(self, auth_client, other_user):
+    def test_other_users_batch_can_be_cancelled(self, auth_client, other_user):
+        """Cancel is shared: the tracking page renders a working cancel button on any batch."""
         other_batch = BulkRerunBatch.objects.create(
             created_by=other_user,
             mode=BulkRerunBatch.Mode.INDIVIDUAL,
@@ -1116,7 +1138,9 @@ class TestBulkRerunBatchCancel:
             status=BulkRerunBatch.Status.RUNNING,
         )
         resp = auth_client.post(self._url(other_batch.id))
-        assert resp.status_code == 404
+        assert resp.status_code == 200
+        other_batch.refresh_from_db()
+        assert other_batch.status == BulkRerunBatch.Status.FAILED
 
     def test_terminal_batch_returns_400(self, auth_client, user):
         batch = BulkRerunBatch.objects.create(
