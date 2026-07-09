@@ -220,6 +220,30 @@ class BulkRerunBatchSerializer(serializers.ModelSerializer):
         return 1  # pending or running — course creation phase
 
 
+class CourseRerunJobStatusSerializer(CourseRerunJobBriefSerializer):
+    """
+    Job summary without nested logs.
+
+    Used by the batch detail endpoint when ``?include_logs=false`` — the
+    polling payload stays constant-size regardless of how many log lines the
+    batch has produced.  Log lines are fetched incrementally per job via
+    CourseRerunJobLogsView (?since=<id>) instead.
+    """
+
+    logs = None
+
+    class Meta(CourseRerunJobBriefSerializer.Meta):
+        """Same fields as the brief serializer minus the nested logs list."""
+
+        fields = [f for f in CourseRerunJobBriefSerializer.Meta.fields if f != 'logs']
+
+
+class BulkRerunBatchStatusSerializer(BulkRerunBatchSerializer):
+    """Batch detail without nested job logs — see CourseRerunJobStatusSerializer."""
+
+    jobs = CourseRerunJobStatusSerializer(many=True, read_only=True)
+
+
 class BulkRerunBatchSummarySerializer(serializers.ModelSerializer):
     """
     Lightweight serializer for the batch list endpoint.
