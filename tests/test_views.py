@@ -569,6 +569,7 @@ class TestCourseRerunJobDetail:
             'source_course_key', 'target_course_key',
             'celery_task_id', 'error_message',
             'batch', 'position', 'settings_applied',
+            'course_created', 'rolled_back',
         }
         assert expected_fields == set(resp.data.keys())
 
@@ -1167,3 +1168,262 @@ class TestBulkRerunBatchCancel:
         auth_client.post(self._url(running_batch.id))
         statuses = list(running_batch.jobs.values_list('status', flat=True))
         assert all(s == CourseRerunJob.Status.FAILED for s in statuses)
+
+
+# ── Rollback: POST /batches/<uuid>/rollback/ + cancel's rollback flag ────────
+
+@pytest.fixture
+def mock_rollback_task():
+    """Prevent dispatch_batch_rollback from actually running during view tests."""
+    with patch('openedx_bulk_rerun_ext.tasks.dispatch_batch_rollback') as mock:
+        yield mock
+
+
+def _run_dispatch_inline():
+    """Context managers that run the on_commit + thread dispatch synchronously."""
+    return (
+        patch('openedx_bulk_rerun_ext.views.transaction.on_commit', side_effect=lambda f: f()),
+        patch('openedx_bulk_rerun_ext.views.threading.Thread', _SyncThread),
+    )
+
+
+class TestBulkRerunBatchRollback:
+    """POST /batches/<uuid>/rollback/ — roll back a terminal batch from history."""
+
+    def _url(self, batch_id):
+        return reverse('bulk_rerun:batches-rollback', kwargs={'batch_id': batch_id})
+
+    @pytest.fixture
+    def partial_batch(self, user):
+        """A PARTIAL batch with one created course and one failed job."""
+        batch = BulkRerunBatch.objects.create(
+            created_by=user,
+            mode=BulkRerunBatch.Mode.INDIVIDUAL,
+            target_run='2026_2027',
+            status=BulkRerunBatch.Status.PARTIAL,
+        )
+        CourseRerunJob.objects.create(
+            source_course_key=SOURCE_KEY,
+            target_course_key=TARGET_KEY,
+            created_by=user,
+            batch=batch,
+            position=0,
+            status=CourseRerunJob.Status.SUCCEEDED,
+            course_created=True,
+        )
+        CourseRerunJob.objects.create(
+            source_course_key=SOURCE_KEY,
+            target_course_key=ALT_TARGET,
+            created_by=user,
+            batch=batch,
+            position=1,
+            status=CourseRerunJob.Status.FAILED,
+        )
+        return batch
+
+    def test_requires_authentication(self, anon_client, partial_batch):
+        resp = anon_client.post(self._url(partial_batch.id))
+        assert resp.status_code == 401
+
+    def test_nonexistent_batch_returns_404(self, auth_client):
+        resp = auth_client.post(self._url(uuid.uuid4()))
+        assert resp.status_code == 404
+
+    def test_running_batch_returns_400(self, auth_client, user, mock_rollback_task):
+        batch = BulkRerunBatch.objects.create(
+            created_by=user,
+            mode=BulkRerunBatch.Mode.INDIVIDUAL,
+            target_run='2026_2027',
+            status=BulkRerunBatch.Status.RUNNING,
+        )
+        resp = auth_client.post(self._url(batch.id))
+        assert resp.status_code == 400
+        assert 'still running' in resp.data['error']
+
+    def test_dry_run_batch_returns_400(self, auth_client, user, mock_rollback_task):
+        batch = BulkRerunBatch.objects.create(
+            created_by=user,
+            mode=BulkRerunBatch.Mode.INDIVIDUAL,
+            target_run='2026_2027',
+            status=BulkRerunBatch.Status.SUCCEEDED,
+            is_dry_run=True,
+        )
+        resp = auth_client.post(self._url(batch.id))
+        assert resp.status_code == 400
+        assert 'Dry-run' in resp.data['error']
+
+    def test_already_rolled_back_returns_400(self, auth_client, partial_batch, mock_rollback_task):
+        partial_batch.rollback_status = BulkRerunBatch.RollbackStatus.SUCCEEDED
+        partial_batch.save()
+        resp = auth_client.post(self._url(partial_batch.id))
+        assert resp.status_code == 400
+        assert 'already requested' in resp.data['error']
+
+    def test_no_created_courses_returns_400(self, auth_client, user, mock_rollback_task):
+        batch = BulkRerunBatch.objects.create(
+            created_by=user,
+            mode=BulkRerunBatch.Mode.INDIVIDUAL,
+            target_run='2026_2027',
+            status=BulkRerunBatch.Status.FAILED,
+        )
+        CourseRerunJob.objects.create(
+            source_course_key=SOURCE_KEY,
+            target_course_key=TARGET_KEY,
+            created_by=user,
+            batch=batch,
+            status=CourseRerunJob.Status.FAILED,
+        )
+        resp = auth_client.post(self._url(batch.id))
+        assert resp.status_code == 400
+        assert 'no rollback-eligible courses' in resp.data['error']
+
+    def test_success_returns_202_and_dispatches(self, auth_client, partial_batch, mock_rollback_task):
+        on_commit_patch, thread_patch = _run_dispatch_inline()
+        with on_commit_patch, thread_patch:
+            resp = auth_client.post(self._url(partial_batch.id))
+        assert resp.status_code == 202
+        assert resp.data['rollback_status'] == 'pending'
+        assert resp.data['eligible_courses'] == 1
+        mock_rollback_task.apply.assert_called_once()
+        partial_batch.refresh_from_db()
+        assert partial_batch.rollback_status == BulkRerunBatch.RollbackStatus.PENDING
+
+    def test_succeeded_batch_is_eligible(self, auth_client, partial_batch, mock_rollback_task):
+        """A fully succeeded batch can be rolled back (mistake noticed after the fact)."""
+        partial_batch.status = BulkRerunBatch.Status.SUCCEEDED
+        partial_batch.save()
+        on_commit_patch, thread_patch = _run_dispatch_inline()
+        with on_commit_patch, thread_patch:
+            resp = auth_client.post(self._url(partial_batch.id))
+        assert resp.status_code == 202
+
+    def test_other_users_batch_can_be_rolled_back(self, auth_client, other_user, mock_rollback_task):
+        """Shared tracking view: rollback is not owner-scoped, matching cancel."""
+        batch = BulkRerunBatch.objects.create(
+            created_by=other_user,
+            mode=BulkRerunBatch.Mode.INDIVIDUAL,
+            target_run='2026_2027',
+            status=BulkRerunBatch.Status.PARTIAL,
+        )
+        CourseRerunJob.objects.create(
+            source_course_key=SOURCE_KEY,
+            target_course_key=TARGET_KEY,
+            created_by=other_user,
+            batch=batch,
+            status=CourseRerunJob.Status.SUCCEEDED,
+            course_created=True,
+        )
+        on_commit_patch, thread_patch = _run_dispatch_inline()
+        with on_commit_patch, thread_patch:
+            resp = auth_client.post(self._url(batch.id))
+        assert resp.status_code == 202
+
+
+class TestBulkRerunBatchCancelWithRollback:
+    """POST /batches/<uuid>/cancel/ with {"rollback": true} dispatches a rollback."""
+
+    def _url(self, batch_id):
+        return reverse('bulk_rerun:batches-cancel', kwargs={'batch_id': batch_id})
+
+    @pytest.fixture
+    def running_batch(self, user):
+        batch = BulkRerunBatch.objects.create(
+            created_by=user,
+            mode=BulkRerunBatch.Mode.INDIVIDUAL,
+            target_run='2026_2027',
+            status=BulkRerunBatch.Status.RUNNING,
+        )
+        CourseRerunJob.objects.create(
+            source_course_key=SOURCE_KEY,
+            target_course_key=TARGET_KEY,
+            created_by=user,
+            batch=batch,
+            position=0,
+            status=CourseRerunJob.Status.SUCCEEDED,
+            course_created=True,
+        )
+        CourseRerunJob.objects.create(
+            source_course_key=SOURCE_KEY,
+            target_course_key=ALT_TARGET,
+            created_by=user,
+            batch=batch,
+            position=1,
+            status=CourseRerunJob.Status.RUNNING,
+        )
+        return batch
+
+    def test_cancel_with_rollback_sets_pending_and_dispatches(
+        self, auth_client, running_batch, mock_rollback_task,
+    ):
+        on_commit_patch, thread_patch = _run_dispatch_inline()
+        with on_commit_patch, thread_patch:
+            resp = auth_client.post(self._url(running_batch.id), {'rollback': True}, format='json')
+        assert resp.status_code == 200
+        assert resp.data['rollback_status'] == 'pending'
+        mock_rollback_task.apply.assert_called_once()
+        running_batch.refresh_from_db()
+        assert running_batch.rollback_status == BulkRerunBatch.RollbackStatus.PENDING
+        assert running_batch.status == BulkRerunBatch.Status.FAILED
+
+    def test_cancel_without_rollback_leaves_status_none(
+        self, auth_client, running_batch, mock_rollback_task,
+    ):
+        resp = auth_client.post(self._url(running_batch.id))
+        assert resp.status_code == 200
+        assert resp.data['rollback_status'] == 'none'
+        mock_rollback_task.apply.assert_not_called()
+
+    def test_cancel_dry_run_with_rollback_flag_ignores_rollback(
+        self, auth_client, user, mock_rollback_task,
+    ):
+        batch = BulkRerunBatch.objects.create(
+            created_by=user,
+            mode=BulkRerunBatch.Mode.INDIVIDUAL,
+            target_run='2026_2027',
+            status=BulkRerunBatch.Status.RUNNING,
+            is_dry_run=True,
+        )
+        resp = auth_client.post(self._url(batch.id), {'rollback': True}, format='json')
+        assert resp.status_code == 200
+        assert resp.data['rollback_status'] == 'none'
+        mock_rollback_task.apply.assert_not_called()
+
+
+class TestRollbackFieldsInSerializers:
+    """Rollback state is exposed on both the list summary and the batch detail."""
+
+    def test_summary_includes_rollback_fields(self, auth_client, user):
+        batch = BulkRerunBatch.objects.create(
+            created_by=user,
+            mode=BulkRerunBatch.Mode.INDIVIDUAL,
+            target_run='2026_2027',
+            status=BulkRerunBatch.Status.PARTIAL,
+        )
+        CourseRerunJob.objects.create(
+            source_course_key=SOURCE_KEY,
+            target_course_key=TARGET_KEY,
+            created_by=user,
+            batch=batch,
+            status=CourseRerunJob.Status.SUCCEEDED,
+            course_created=True,
+        )
+        resp = auth_client.get('/batches/')
+        row = resp.data[0]
+        assert row['rollback_status'] == 'none'
+        assert row['rolled_back_at'] is None
+        assert row['created_courses'] == 1
+
+    def test_detail_includes_rollback_fields_and_job_flags(self, auth_client, user, existing_batch):
+        CourseRerunJob.objects.create(
+            source_course_key=SOURCE_KEY,
+            target_course_key=TARGET_KEY,
+            created_by=user,
+            batch=existing_batch,
+            status=CourseRerunJob.Status.SUCCEEDED,
+            course_created=True,
+        )
+        url = reverse('bulk_rerun:batches-detail', kwargs={'batch_id': existing_batch.id})
+        resp = auth_client.get(url)
+        assert resp.data['rollback_status'] == 'none'
+        assert resp.data['jobs'][0]['course_created'] is True
+        assert resp.data['jobs'][0]['rolled_back'] is False

@@ -8,6 +8,7 @@ from .views import (
     BulkRerunBatchCancelView,
     BulkRerunBatchDetailView,
     BulkRerunBatchListCreateView,
+    BulkRerunBatchRollbackView,
     CourseRerunJobDetail,
     CourseRerunJobListCreate,
     CourseRerunJobLogsView,
@@ -26,5 +27,6 @@ urlpatterns = [
     path('batches/', BulkRerunBatchListCreateView.as_view(), name='batches-list'),
     path('batches/<uuid:batch_id>/', BulkRerunBatchDetailView.as_view(), name='batches-detail'),
     path('batches/<uuid:batch_id>/cancel/', BulkRerunBatchCancelView.as_view(), name='batches-cancel'),
+    path('batches/<uuid:batch_id>/rollback/', BulkRerunBatchRollbackView.as_view(), name='batches-rollback'),
     path('jobs/<uuid:job_id>/logs/', CourseRerunJobLogsView.as_view(), name='jobs-logs'),
 ]

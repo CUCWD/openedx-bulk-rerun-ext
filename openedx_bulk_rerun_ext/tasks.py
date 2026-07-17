@@ -48,9 +48,73 @@ def _check_batch_completion(batch_id):
     batch.save(update_fields=['status', 'completed_at'])
 
 
+def _rollback_job_course(job):
+    """
+    Delete the course a job created, plus the platform rows that reference it.
+
+    Returns True on success (or when the course is already gone), False when
+    the platform delete raised.  Only ever called for jobs with
+    ``course_created=True`` — courses a batch merely adopted are untouchable.
+    Deletion uses the platform's delete_course so content, team roles, and
+    enrollments are removed together; falls back to the raw modulestore
+    delete when the contentstore helper is unavailable.
+    """
+    from opaque_keys.edx.keys import CourseKey  # pylint: disable=import-outside-toplevel
+
+    target_key = CourseKey.from_string(job.target_course_key)
+
+    # If the course is already gone (deleted manually, or a previous rollback
+    # attempt got interrupted after the delete), just mark the job rolled back.
+    course_exists = True
+    try:
+        # pylint: disable-next=import-outside-toplevel,import-error
+        from xmodule.modulestore.django import modulestore as get_store
+        course_exists = get_store().has_course(target_key)
+    except Exception:  # pylint: disable=broad-exception-caught
+        pass
+
+    if course_exists:
+        _log(job.id, 'info', f'Rollback: deleting created course {job.target_course_key}...')
+        try:
+            try:
+                # pylint: disable-next=import-outside-toplevel,import-error
+                from cms.djangoapps.contentstore.utils import delete_course
+                delete_course(target_key, job.created_by_id)
+            except ImportError:
+                # pylint: disable-next=import-outside-toplevel,import-error
+                from xmodule.modulestore.django import modulestore as get_store
+                get_store().delete_course(target_key, job.created_by_id)
+        except Exception as exc:  # pylint: disable=broad-exception-caught
+            _log(job.id, 'err', f'Rollback failed for {job.target_course_key}: {exc}')
+            return False
+    else:
+        _log(job.id, 'info',
+             f'Rollback: course {job.target_course_key} no longer exists — nothing to delete.')
+
+    # Mirror of the stale-row cleanup done before creation: remove the
+    # org-course association and rerun-state rows so a future rerun of the
+    # same target key starts clean.
+    try:
+        from organizations.models import OrganizationCourse  # pylint: disable=import-outside-toplevel,import-error
+        OrganizationCourse.objects.filter(course_id=str(target_key)).delete()
+    except Exception:  # pylint: disable=broad-exception-caught
+        pass
+    try:
+        # pylint: disable-next=import-outside-toplevel,import-error
+        from common.djangoapps.course_action_state.models import CourseRerunState
+        CourseRerunState.objects.filter(course_key=str(target_key)).delete()
+    except Exception:  # pylint: disable=broad-exception-caught
+        pass
+
+    job.rolled_back = True
+    job.save(update_fields=['rolled_back'])
+    _log(job.id, 'ok', f'Rollback complete: {job.target_course_key} removed.')
+    return True
+
+
 def _finalize_job(job, success, error=''):
     """Set terminal status on a job and roll up the parent batch if one exists."""
-    from .models import CourseRerunJob  # pylint: disable=import-outside-toplevel
+    from .models import BulkRerunBatch, CourseRerunJob  # pylint: disable=import-outside-toplevel
     job.status = CourseRerunJob.Status.SUCCEEDED if success else CourseRerunJob.Status.FAILED
     job.completed_at = timezone.now()
     update_fields = ['status', 'completed_at']
@@ -60,6 +124,19 @@ def _finalize_job(job, success, error=''):
     job.save(update_fields=update_fields)
     if job.batch_id:
         _check_batch_completion(str(job.batch_id))
+
+        # Race guard: the user may have hit Stop-with-rollback while this job
+        # was still mid-clone (cancel marks DB rows failed but cannot halt an
+        # executing worker).  If a rollback was requested for the batch and
+        # this job created its course, delete it now so nothing is orphaned.
+        try:
+            batch = BulkRerunBatch.objects.get(id=job.batch_id)
+        except BulkRerunBatch.DoesNotExist:
+            return
+        if batch.rollback_requested and job.course_created and not job.rolled_back:
+            _log(job.id, 'warn',
+                 'Job finished after a rollback was requested — removing its course.')
+            _rollback_job_course(job)
 
 
 @shared_task
@@ -213,6 +290,12 @@ def run_course_rerun(self, job_id):  # pylint: disable=too-many-statements
 
             _log(job.id, 'ok', 'Course shell created. Target CourseKey registered.')
 
+            # Stamp the ONLY evidence rollback trusts: this job actually created
+            # the course (as opposed to adopting a pre-existing one via the
+            # already-exists paths above, which never set the flag).
+            job.course_created = True
+            job.save(update_fields=['course_created'])
+
         # Chain to apply_course_settings regardless of dry-run; that task
         # applies (or simulates) scheduling, certs, team access, and gating,
         # then sets job.status = succeeded when done.
@@ -330,3 +413,42 @@ def apply_course_settings(self, job_id):
             _finalize_job(job, success=False, error=str(exc))
         else:
             raise self.retry(exc=exc)
+
+
+@shared_task
+def dispatch_batch_rollback(batch_id):
+    """
+    Delete every course this batch created (jobs with ``course_created=True``).
+
+    Runs sequentially in one task — batch sizes are small (≤ a few dozen) and
+    course deletion is heavyweight, so fan-out buys nothing but contention.
+    Progress streams into each job's CourseRerunLog, which the tracking UI
+    already displays.  Jobs that never created a course are skipped; the run
+    lifecycle ``status`` field is never touched — rollback state lives in the
+    separate ``rollback_status`` field.
+    """
+    from .models import BulkRerunBatch  # pylint: disable=import-outside-toplevel
+    try:
+        batch = BulkRerunBatch.objects.get(id=batch_id)
+    except BulkRerunBatch.DoesNotExist:
+        return
+
+    batch.rollback_status = BulkRerunBatch.RollbackStatus.RUNNING
+    batch.save(update_fields=['rollback_status'])
+
+    jobs = batch.jobs.filter(course_created=True, rolled_back=False).order_by('position')
+    failures = 0
+    total = 0
+    for job in jobs:
+        total += 1
+        if not _rollback_job_course(job):
+            failures += 1
+
+    if failures == 0:
+        batch.rollback_status = BulkRerunBatch.RollbackStatus.SUCCEEDED
+    elif failures == total:
+        batch.rollback_status = BulkRerunBatch.RollbackStatus.FAILED
+    else:
+        batch.rollback_status = BulkRerunBatch.RollbackStatus.PARTIAL
+    batch.rolled_back_at = timezone.now()
+    batch.save(update_fields=['rollback_status', 'rolled_back_at'])
