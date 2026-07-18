@@ -46,7 +46,7 @@ class _SyncThread:
 
 @pytest.fixture
 def user():
-    return User.objects.create_user(username='staff', password='pw')
+    return User.objects.create_superuser(username='superuser', password='pw')
 
 
 @pytest.fixture
@@ -64,6 +64,13 @@ def auth_client(user):
 @pytest.fixture
 def anon_client():
     return APIClient()
+
+
+@pytest.fixture
+def non_superuser_client():
+    client = APIClient()
+    client.force_authenticate(user=User.objects.create_user(username='staff', password='pw', is_staff=True))
+    return client
 
 
 @pytest.fixture
@@ -101,6 +108,44 @@ def existing_batch(user):
 
 
 # ── Phase 1: POST /validate/ ──────────────────────────────────────────────────
+
+
+class TestBulkRerunAccessView:
+    """GET /access/ — expose the exact Django superuser status to Authoring."""
+
+    URL = '/access/'
+
+    def test_requires_authentication(self, anon_client):
+        assert anon_client.get(self.URL).status_code == 401
+
+    def test_reports_superuser_access(self, auth_client):
+        response = auth_client.get(self.URL)
+        assert response.status_code == 200
+        assert response.data == {'is_superuser': True}
+
+    def test_reports_no_access_for_staff_non_superuser(self, non_superuser_client):
+        response = non_superuser_client.get(self.URL)
+        assert response.status_code == 200
+        assert response.data == {'is_superuser': False}
+
+
+@pytest.mark.parametrize(
+    ('method', 'url'),
+    [
+        ('post', '/validate/'),
+        ('get', '/jobs/'),
+        ('get', '/jobs/00000000-0000-0000-0000-000000000000/'),
+        ('get', '/batches/'),
+        ('get', '/batches/00000000-0000-0000-0000-000000000000/'),
+        ('post', '/batches/00000000-0000-0000-0000-000000000000/cancel/'),
+        ('get', '/jobs/00000000-0000-0000-0000-000000000000/logs/'),
+    ],
+)
+def test_bulk_rerun_endpoints_require_superuser(non_superuser_client, method, url):
+    """Staff users who are not superusers cannot bypass the hidden frontend slot."""
+    response = getattr(non_superuser_client, method)(url, format='json')
+    assert response.status_code == 403
+
 
 class TestValidateCourseKeysView:
     """POST /validate/ — key conflict detection before bulk submission."""
