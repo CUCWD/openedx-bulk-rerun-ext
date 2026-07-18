@@ -14,6 +14,7 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from .models import BulkRerunBatch, CourseRerunJob, CourseRerunLog, CourseRerunSettings, CourseRerunTeamMember
+from .permissions import IsSuperuser
 from .serializers import (
     BulkRerunBatchCreateSerializer,
     BulkRerunBatchSerializer,
@@ -47,6 +48,16 @@ _RESERVED_STATUSES = [
 # ── Phase 1 views ─────────────────────────────────────────────────────────────
 
 
+class BulkRerunAccessView(APIView):
+    """Return whether the requesting user may access bulk reruns."""
+
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        """Expose the user's exact Django superuser status to Authoring."""
+        return Response({'is_superuser': request.user.is_superuser})
+
+
 class ValidateCourseKeysView(APIView):
     """
     Check a list of target course keys for conflicts before bulk submission.
@@ -57,7 +68,7 @@ class ValidateCourseKeysView(APIView):
     to surface conflicts before submission.
     """
 
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsSuperuser]
 
     def post(self, request):
         """Validate a list of target course keys and return those that already exist."""
@@ -127,7 +138,7 @@ class CourseRerunJobListCreate(APIView):
     jobs belonging to the same bulk submission.
     """
 
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsSuperuser]
 
     def get(self, request):
         """Return all rerun jobs owned by the requesting user, newest first."""
@@ -248,7 +259,7 @@ class CourseRerunJobDetail(APIView):
     exist or was not created by the requesting user.
     """
 
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsSuperuser]
 
     def get(self, request, job_id):
         """Return the current state of a single rerun job; 404 if not owned by the caller."""
@@ -284,7 +295,7 @@ class BulkRerunBatchListCreateView(APIView):
          Returns 202 Accepted with the batch ID and initial job list.
     """
 
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsSuperuser]
 
     def get(self, request):
         """List the caller's batches; ?status= filters by comma-separated status values."""
@@ -454,7 +465,7 @@ class BulkRerunBatchDetailView(APIView):
     hydration on page load/refresh and for the history view.
     """
 
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsSuperuser]
 
     def get(self, request, batch_id):
         """Return batch status and the nested job list; 404 if not owned by the caller."""
@@ -495,7 +506,7 @@ class BulkRerunBatchCancelView(APIView):
     Returns 404 if the batch does not exist or was not created by the caller.
     """
 
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsSuperuser]
 
     def post(self, request, batch_id):
         """Cancel a non-terminal batch by marking all active jobs and the batch as failed."""
@@ -544,7 +555,7 @@ class CourseRerunJobLogsView(APIView):
     Returns 404 if the job does not exist or was not created by the caller.
     """
 
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsSuperuser]
 
     def get(self, request, job_id):
         """Return log lines for a job, optionally filtered to those newer than ?since=<id>."""
