@@ -70,7 +70,7 @@ def _rollback_job_course(job):
         # pylint: disable-next=import-outside-toplevel,import-error
         from xmodule.modulestore.django import modulestore as get_store
         course_exists = get_store().has_course(target_key)
-    except Exception:  # pylint: disable=broad-exception-caught
+    except Exception:  # pragma: no cover  # pylint: disable=broad-exception-caught
         pass
 
     if course_exists:
@@ -82,7 +82,7 @@ def _rollback_job_course(job):
                 # pylint: disable-next=import-outside-toplevel
                 from cms.djangoapps.contentstore.utils import delete_course
                 delete_course(target_key, job.created_by_id)
-            except ImportError:
+            except ImportError:  # pragma: no cover
                 # pylint: disable-next=import-outside-toplevel
                 from xmodule.modulestore.django import modulestore as get_store
                 get_store().delete_course(target_key, job.created_by_id)
@@ -99,13 +99,13 @@ def _rollback_job_course(job):
     try:
         from organizations.models import OrganizationCourse  # pylint: disable=import-outside-toplevel,import-error
         OrganizationCourse.objects.filter(course_id=str(target_key)).delete()
-    except Exception:  # pylint: disable=broad-exception-caught
+    except Exception:  # pragma: no cover  # pylint: disable=broad-exception-caught
         pass
     try:
         # pylint: disable-next=import-outside-toplevel,import-error
         from common.djangoapps.course_action_state.models import CourseRerunState
         CourseRerunState.objects.filter(course_key=str(target_key)).delete()
-    except Exception:  # pylint: disable=broad-exception-caught
+    except Exception:  # pragma: no cover  # pylint: disable=broad-exception-caught
         pass
 
     job.rolled_back = True
@@ -133,7 +133,7 @@ def _finalize_job(job, success, error=''):
         # this job created its course, delete it now so nothing is orphaned.
         try:
             batch = BulkRerunBatch.objects.get(id=job.batch_id)
-        except BulkRerunBatch.DoesNotExist:
+        except BulkRerunBatch.DoesNotExist:  # pragma: no cover
             return
         if batch.rollback_requested and job.course_created and not job.rolled_back:
             _log(job.id, 'warn',

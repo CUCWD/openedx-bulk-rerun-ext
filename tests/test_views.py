@@ -1366,6 +1366,18 @@ class TestBulkRerunBatchCancelWithRollback:
         assert running_batch.rollback_status == BulkRerunBatch.RollbackStatus.PENDING
         assert running_batch.status == BulkRerunBatch.Status.FAILED
 
+    def test_dispatch_exception_marks_rollback_failed(
+        self, auth_client, running_batch, mock_rollback_task,
+    ):
+        """If the rollback dispatch thread raises, rollback_status is set to FAILED."""
+        mock_rollback_task.apply.side_effect = RuntimeError('celery crashed')
+        on_commit_patch, thread_patch = _run_dispatch_inline()
+        with on_commit_patch, thread_patch:
+            resp = auth_client.post(self._url(running_batch.id), {'rollback': True}, format='json')
+        assert resp.status_code == 200
+        running_batch.refresh_from_db()
+        assert running_batch.rollback_status == BulkRerunBatch.RollbackStatus.FAILED
+
     def test_cancel_without_rollback_leaves_status_none(
         self, auth_client, running_batch, mock_rollback_task,
     ):
