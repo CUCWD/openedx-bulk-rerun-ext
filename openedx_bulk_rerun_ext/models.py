@@ -35,9 +35,10 @@ class BulkRerunBatch(models.Model):
 
     class RollbackStatus(models.TextChoices):
         """
-        Lifecycle of a rollback pass, tracked separately from ``status`` so the
-        existing batch state machine (and every client that filters on it) is
-        untouched. NONE means no rollback has been requested.
+        Lifecycle of a rollback pass, tracked separately from ``status``.
+
+        Kept separate so the existing batch state machine (and every client
+        that filters on it) is untouched. NONE means none has been requested.
         """
 
         NONE = 'none', 'None'

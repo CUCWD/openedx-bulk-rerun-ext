@@ -1327,6 +1327,7 @@ class TestBulkRerunBatchCancelWithRollback:
 
     @pytest.fixture
     def running_batch(self, user):
+        """A RUNNING batch with one created course and one still-running job."""
         batch = BulkRerunBatch.objects.create(
             created_by=user,
             mode=BulkRerunBatch.Mode.INDIVIDUAL,

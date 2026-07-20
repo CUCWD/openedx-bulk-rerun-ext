@@ -77,11 +77,13 @@ def _rollback_job_course(job):
         _log(job.id, 'info', f'Rollback: deleting created course {job.target_course_key}...')
         try:
             try:
-                # pylint: disable-next=import-outside-toplevel,import-error
+                # import-error is intentionally not suppressed: the try/except
+                # ImportError below already tells pylint this import may fail.
+                # pylint: disable-next=import-outside-toplevel
                 from cms.djangoapps.contentstore.utils import delete_course
                 delete_course(target_key, job.created_by_id)
             except ImportError:
-                # pylint: disable-next=import-outside-toplevel,import-error
+                # pylint: disable-next=import-outside-toplevel
                 from xmodule.modulestore.django import modulestore as get_store
                 get_store().delete_course(target_key, job.created_by_id)
         except Exception as exc:  # pylint: disable=broad-exception-caught

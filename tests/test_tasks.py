@@ -753,7 +753,7 @@ class TestRollbackJobCourse:
 class TestDispatchBatchRollback:
     """dispatch_batch_rollback processes only course_created jobs and aggregates status."""
 
-    def _add_job(self, batch, user, target, created, position):
+    def _add_job(self, batch, user, target, *, created, position):
         return CourseRerunJob.objects.create(
             source_course_key=SOURCE_KEY,
             target_course_key=target,
@@ -768,15 +768,15 @@ class TestDispatchBatchRollback:
         dispatch_batch_rollback.apply(args=['00000000-0000-0000-0000-000000000000'])
 
     def test_only_created_jobs_rolled_back(self, batch, user):
-        created = self._add_job(batch, user, TARGET_KEY, True, 0)
-        adopted = self._add_job(batch, user, 'course-v1:CA+X+2026', False, 1)
+        created = self._add_job(batch, user, TARGET_KEY, created=True, position=0)
+        adopted = self._add_job(batch, user, 'course-v1:CA+X+2026', created=False, position=1)
         with patch('openedx_bulk_rerun_ext.tasks._rollback_job_course', return_value=True) as rb:
             dispatch_batch_rollback.apply(args=[str(batch.id)])
         assert [c.args[0].id for c in rb.call_args_list] == [created.id]
         assert adopted.id not in [c.args[0].id for c in rb.call_args_list]
 
     def test_all_success_sets_rollback_succeeded(self, batch, user):
-        self._add_job(batch, user, TARGET_KEY, True, 0)
+        self._add_job(batch, user, TARGET_KEY, created=True, position=0)
         with patch('openedx_bulk_rerun_ext.tasks._rollback_job_course', return_value=True):
             dispatch_batch_rollback.apply(args=[str(batch.id)])
         batch.refresh_from_db()
@@ -784,22 +784,22 @@ class TestDispatchBatchRollback:
         assert batch.rolled_back_at is not None
 
     def test_mixed_results_set_rollback_partial(self, batch, user):
-        self._add_job(batch, user, TARGET_KEY, True, 0)
-        self._add_job(batch, user, 'course-v1:CA+X+2026', True, 1)
+        self._add_job(batch, user, TARGET_KEY, created=True, position=0)
+        self._add_job(batch, user, 'course-v1:CA+X+2026', created=True, position=1)
         with patch('openedx_bulk_rerun_ext.tasks._rollback_job_course', side_effect=[True, False]):
             dispatch_batch_rollback.apply(args=[str(batch.id)])
         batch.refresh_from_db()
         assert batch.rollback_status == BulkRerunBatch.RollbackStatus.PARTIAL
 
     def test_all_failures_set_rollback_failed(self, batch, user):
-        self._add_job(batch, user, TARGET_KEY, True, 0)
+        self._add_job(batch, user, TARGET_KEY, created=True, position=0)
         with patch('openedx_bulk_rerun_ext.tasks._rollback_job_course', return_value=False):
             dispatch_batch_rollback.apply(args=[str(batch.id)])
         batch.refresh_from_db()
         assert batch.rollback_status == BulkRerunBatch.RollbackStatus.FAILED
 
     def test_no_eligible_jobs_still_succeeds(self, batch, user):
-        self._add_job(batch, user, TARGET_KEY, False, 0)
+        self._add_job(batch, user, TARGET_KEY, created=False, position=0)
         dispatch_batch_rollback.apply(args=[str(batch.id)])
         batch.refresh_from_db()
         assert batch.rollback_status == BulkRerunBatch.RollbackStatus.SUCCEEDED
@@ -807,7 +807,7 @@ class TestDispatchBatchRollback:
     def test_batch_run_status_untouched(self, batch, user):
         batch.status = BulkRerunBatch.Status.PARTIAL
         batch.save()
-        self._add_job(batch, user, TARGET_KEY, True, 0)
+        self._add_job(batch, user, TARGET_KEY, created=True, position=0)
         with patch('openedx_bulk_rerun_ext.tasks._rollback_job_course', return_value=True):
             dispatch_batch_rollback.apply(args=[str(batch.id)])
         batch.refresh_from_db()
