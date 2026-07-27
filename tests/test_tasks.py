@@ -753,6 +753,12 @@ class TestRollbackJobCourse:
 class TestDispatchBatchRollback:
     """dispatch_batch_rollback processes only course_created jobs and aggregates status."""
 
+    @pytest.fixture(autouse=True)
+    def _no_pace(self):
+        """Skip the inter-course pause so the dispatch tests stay fast."""
+        with patch('openedx_bulk_rerun_ext.tasks.time.sleep') as sleep_mock:
+            yield sleep_mock
+
     def _add_job(self, batch, user, target, *, created, position):
         return CourseRerunJob.objects.create(
             source_course_key=SOURCE_KEY,
@@ -766,6 +772,24 @@ class TestDispatchBatchRollback:
 
     def test_nonexistent_batch_does_not_raise(self):
         dispatch_batch_rollback.apply(args=['00000000-0000-0000-0000-000000000000'])
+
+    def test_pace_pauses_between_courses(self, batch, user, _no_pace):
+        """One pause is taken between courses, and none after the final course."""
+        self._add_job(batch, user, TARGET_KEY, created=True, position=0)
+        self._add_job(batch, user, 'course-v1:CA+X+2026', created=True, position=1)
+        with patch('openedx_bulk_rerun_ext.tasks._rollback_job_course', return_value=True):
+            dispatch_batch_rollback.apply(args=[str(batch.id)])
+        assert _no_pace.call_count == 1  # two courses → a single inter-course pause
+
+    def test_pace_setting_zero_skips_pause(self, batch, user, _no_pace):
+        """BULK_RERUN_ROLLBACK_PACE_SECONDS=0 disables the inter-course pause."""
+        from django.test import override_settings  # pylint: disable=import-outside-toplevel
+        self._add_job(batch, user, TARGET_KEY, created=True, position=0)
+        self._add_job(batch, user, 'course-v1:CA+X+2026', created=True, position=1)
+        with override_settings(BULK_RERUN_ROLLBACK_PACE_SECONDS=0), \
+             patch('openedx_bulk_rerun_ext.tasks._rollback_job_course', return_value=True):
+            dispatch_batch_rollback.apply(args=[str(batch.id)])
+        _no_pace.assert_not_called()
 
     def test_only_created_jobs_rolled_back(self, batch, user):
         created = self._add_job(batch, user, TARGET_KEY, created=True, position=0)
