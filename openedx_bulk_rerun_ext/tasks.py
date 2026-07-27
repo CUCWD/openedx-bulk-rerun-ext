@@ -422,13 +422,18 @@ def dispatch_batch_rollback(batch_id):
     """
     Delete every course this batch created (jobs with ``course_created=True``).
 
-    Runs sequentially in one task — batch sizes are small (≤ a few dozen) and
-    course deletion is heavyweight, so fan-out buys nothing but contention.
-    Progress streams into each job's CourseRerunLog, which the tracking UI
-    already displays.  Jobs that never created a course are skipped; the run
-    lifecycle ``status`` field is never touched — rollback state lives in the
-    separate ``rollback_status`` field.
+    Deletions run concurrently in a bounded thread pool within this single task,
+    so a large rollback finishes in roughly wall-time / concurrency instead of
+    the sum of every (heavyweight) course deletion.  The cap
+    (``BULK_RERUN_ROLLBACK_CONCURRENCY``, default 3) mirrors the creation
+    concurrency ceiling so parallel modulestore deletes don't saturate MongoDB.
+    Aggregating status at the end of the one task keeps it race-free — no
+    per-job completion bookkeeping needed.  Progress streams into each job's
+    CourseRerunLog, which the tracking UI displays; jobs that never created a
+    course are skipped; the run-lifecycle ``status`` field is never touched.
     """
+    from concurrent.futures import ThreadPoolExecutor  # pylint: disable=import-outside-toplevel
+    from django.db import connection  # pylint: disable=import-outside-toplevel
     from .models import BulkRerunBatch  # pylint: disable=import-outside-toplevel
     try:
         batch = BulkRerunBatch.objects.get(id=batch_id)
@@ -438,13 +443,26 @@ def dispatch_batch_rollback(batch_id):
     batch.rollback_status = BulkRerunBatch.RollbackStatus.RUNNING
     batch.save(update_fields=['rollback_status'])
 
-    jobs = batch.jobs.filter(course_created=True, rolled_back=False).order_by('position')
-    failures = 0
-    total = 0
-    for job in jobs:
-        total += 1
-        if not _rollback_job_course(job):
-            failures += 1
+    jobs = list(batch.jobs.filter(course_created=True, rolled_back=False).order_by('position'))
+
+    def _delete_one(job):
+        # Runs in a pool thread with its own DB connection; close it afterward so
+        # pooled/reused threads don't leak connections. _rollback_job_course
+        # catches its own errors and returns True/False, so nothing propagates.
+        try:
+            return _rollback_job_course(job)
+        finally:
+            connection.close()
+
+    max_workers = getattr(django_settings, 'BULK_RERUN_ROLLBACK_CONCURRENCY', 3)
+    if jobs:
+        with ThreadPoolExecutor(max_workers=max(1, min(max_workers, len(jobs)))) as pool:
+            results = list(pool.map(_delete_one, jobs))
+    else:
+        results = []
+
+    total = len(results)
+    failures = results.count(False)
 
     if failures == 0:
         batch.rollback_status = BulkRerunBatch.RollbackStatus.SUCCEEDED
