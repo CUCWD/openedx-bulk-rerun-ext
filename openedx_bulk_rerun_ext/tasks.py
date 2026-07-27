@@ -433,7 +433,9 @@ def dispatch_batch_rollback(batch_id):
     course are skipped; the run-lifecycle ``status`` field is never touched.
     """
     from concurrent.futures import ThreadPoolExecutor  # pylint: disable=import-outside-toplevel
+
     from django.db import connection  # pylint: disable=import-outside-toplevel
+
     from .models import BulkRerunBatch  # pylint: disable=import-outside-toplevel
     try:
         batch = BulkRerunBatch.objects.get(id=batch_id)
