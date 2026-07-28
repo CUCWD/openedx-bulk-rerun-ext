@@ -16,3 +16,5 @@ def plugin_settings(settings):
         settings.BULK_RERUN_MAX_CONCURRENT = 3
     if not hasattr(settings, 'BULK_RERUN_SETTINGS_MAX_RETRIES'):
         settings.BULK_RERUN_SETTINGS_MAX_RETRIES = 2
+    if not hasattr(settings, 'BULK_RERUN_CELERY_QUEUE'):
+        settings.BULK_RERUN_CELERY_QUEUE = 'edx.cms.core.bulk_rerun'

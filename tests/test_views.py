@@ -77,7 +77,7 @@ def non_superuser_client():
 def mock_task():
     """Prevent the Celery task from actually dispatching during view tests."""
     with patch('openedx_bulk_rerun_ext.tasks.run_course_rerun') as mock:
-        mock.delay.return_value = MagicMock(id='fake-celery-id')
+        mock.apply.return_value = MagicMock(id='fake-celery-id')
         yield mock
 
 
@@ -375,7 +375,7 @@ class TestCourseRerunJobCreate:
             {'source_course_key': SOURCE_KEY, 'target_course_key': TARGET_KEY},
             format='json',
         )
-        mock_task.delay.assert_called_once()
+        mock_task.apply.assert_called_once()
 
     def test_optional_bulk_job_id_stored(self, auth_client, mock_task):
         bulk_id = str(uuid.uuid4())

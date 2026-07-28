@@ -17,6 +17,7 @@ from django.utils import timezone
 from openedx_bulk_rerun_ext.models import BulkRerunBatch, CourseRerunJob, CourseRerunLog, CourseRerunSettings
 from openedx_bulk_rerun_ext.tasks import (
     _check_batch_completion,
+    _dispatch_task,
     _finalize_job,
     _rollback_job_course,
     apply_course_settings,
@@ -30,6 +31,32 @@ pytestmark = pytest.mark.django_db
 
 SOURCE_KEY = 'course-v1:CA+FAA-ACS-AM-IA-ACE+DEMO'
 TARGET_KEY = 'course-v1:AeroTech+FAA-ACS-AM-IA-ACE+TEST_RUN'
+
+
+class TestDispatchTask:
+    """The dedicated worker must receive every asynchronously dispatched task."""
+
+    def test_routes_to_configured_bulk_rerun_queue(self, settings):
+        settings.BULK_RERUN_USE_CELERY = True
+        settings.BULK_RERUN_CELERY_QUEUE = 'custom.bulk.rerun'
+        task = MagicMock()
+
+        _dispatch_task(task, 'job-id', countdown=2)
+
+        task.apply_async.assert_called_once_with(
+            args=['job-id'], countdown=2, queue='custom.bulk.rerun'
+        )
+
+    def test_uses_default_bulk_rerun_queue(self, settings):
+        settings.BULK_RERUN_USE_CELERY = True
+        del settings.BULK_RERUN_CELERY_QUEUE
+        task = MagicMock()
+
+        _dispatch_task(task, 'job-id')
+
+        task.apply_async.assert_called_once_with(
+            args=['job-id'], queue='edx.cms.core.bulk_rerun'
+        )
 
 
 # ── Platform module mocks ─────────────────────────────────────────────────────

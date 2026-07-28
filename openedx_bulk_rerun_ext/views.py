@@ -273,8 +273,8 @@ class CourseRerunJobListCreate(APIView):
         # Dispatch the Celery task and store its ID so operators can trace it
         # in Flower or the Django admin. The task transitions the job through
         # running → succeeded/failed asynchronously.
-        from .tasks import run_course_rerun  # pylint: disable=import-outside-toplevel
-        result = run_course_rerun.delay(str(job.id))
+        from .tasks import _dispatch_task, run_course_rerun  # pylint: disable=import-outside-toplevel
+        result = _dispatch_task(run_course_rerun, str(job.id))
         job.celery_task_id = result.id
         job.save(update_fields=['celery_task_id'])
 
