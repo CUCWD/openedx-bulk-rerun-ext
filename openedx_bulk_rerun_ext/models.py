@@ -33,6 +33,21 @@ class BulkRerunBatch(models.Model):
         NEW_ORG = 'new_org', 'New Org'
         INDIVIDUAL = 'individual', 'Individual'
 
+    class RollbackStatus(models.TextChoices):
+        """
+        Lifecycle of a rollback pass, tracked separately from ``status``.
+
+        Kept separate so the existing batch state machine (and every client
+        that filters on it) is untouched. NONE means none has been requested.
+        """
+
+        NONE = 'none', 'None'
+        PENDING = 'pending', 'Pending'
+        RUNNING = 'running', 'Running'
+        SUCCEEDED = 'succeeded', 'Succeeded'
+        PARTIAL = 'partial', 'Partial'
+        FAILED = 'failed', 'Failed'
+
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     created_by = models.ForeignKey(
         settings.AUTH_USER_MODEL,
@@ -62,6 +77,17 @@ class BulkRerunBatch(models.Model):
             'display context on any device or after a page refresh.'
         ),
     )
+    rollback_status = models.CharField(
+        max_length=16,
+        choices=RollbackStatus.choices,
+        default=RollbackStatus.NONE,
+        help_text=(
+            'State of the rollback pass that deletes courses this batch '
+            'created. Kept separate from status so rollback never disturbs '
+            'the run-lifecycle state machine.'
+        ),
+    )
+    rolled_back_at = models.DateTimeField(null=True, blank=True)
 
     class Meta:
         """Default ordering for batch listings."""
@@ -91,6 +117,16 @@ class BulkRerunBatch(models.Model):
         return self.status in (
             self.Status.SUCCEEDED, self.Status.FAILED, self.Status.PARTIAL
         )
+
+    @property
+    def rollback_requested(self):
+        """Return True once a rollback has been requested for this batch."""
+        return self.rollback_status != self.RollbackStatus.NONE
+
+    @property
+    def created_courses(self):
+        """Return the number of jobs whose course this batch actually created."""
+        return self.jobs.filter(course_created=True).count()
 
 
 class CourseRerunJob(models.Model):
@@ -172,6 +208,14 @@ class CourseRerunJob(models.Model):
         ]
 
     settings_applied = models.BooleanField(default=False)
+    # Stamped the moment the platform's rerun_course reports success. This is
+    # the ONLY evidence rollback trusts when deciding what to delete: jobs that
+    # adopted a pre-existing target course never get the flag, so their courses
+    # can never be deleted by a rollback. Batches from before this field exists
+    # have no flags and are therefore not eligible for rollback.
+    course_created = models.BooleanField(default=False)
+    # Set once a rollback pass has deleted (or confirmed gone) this job's course.
+    rolled_back = models.BooleanField(default=False)
 
     @property
     def is_terminal(self):

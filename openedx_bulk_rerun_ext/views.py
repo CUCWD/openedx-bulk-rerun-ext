@@ -45,6 +45,38 @@ _RESERVED_STATUSES = [
 ]
 
 
+def _dispatch_rollback_in_background(batch_id_str):
+    """
+    Start dispatch_batch_rollback without blocking the HTTP response.
+
+    Mirrors the batch-creation dispatch pattern: a daemon thread (or Celery,
+    per BULK_RERUN_USE_CELERY inside _dispatch_task) runs the rollback while
+    the view returns immediately and the UI polls rollback_status.
+    """
+    from .tasks import _dispatch_task, dispatch_batch_rollback  # pylint: disable=import-outside-toplevel
+
+    log = logging.getLogger(__name__)
+
+    def _run():
+        close_old_connections()
+        try:
+            _dispatch_task(dispatch_batch_rollback, batch_id_str)
+        except Exception:  # pylint: disable=broad-exception-caught
+            log.exception('[BulkRerun] Rollback dispatch failed for batch %s', batch_id_str)
+            try:
+                BulkRerunBatch.objects.filter(id=batch_id_str).update(
+                    rollback_status=BulkRerunBatch.RollbackStatus.FAILED,
+                )
+            except Exception:  # pragma: no cover  # pylint: disable=broad-exception-caught
+                pass
+        finally:
+            close_old_connections()
+
+    transaction.on_commit(
+        lambda: threading.Thread(target=_run, daemon=True).start()
+    )
+
+
 # ── Phase 1 views ─────────────────────────────────────────────────────────────
 
 
@@ -282,7 +314,9 @@ class BulkRerunBatchListCreateView(APIView):
     """
     List or create bulk rerun batches.
 
-    GET  /api/bulk-rerun/batches/           — lists the caller's batches.
+    GET  /api/bulk-rerun/batches/           — lists ALL users' batches, so the
+         Tracking Progress page shows a shared view of every operator's runs
+         (each entry carries created_by_username for the UI's user filter).
          ?status=running,pending             — optional comma-separated filter.
          Returns the lightweight summary serializer (no nested job logs) so the
          Tracking Progress page can recover in-flight batches on page load or
@@ -298,8 +332,8 @@ class BulkRerunBatchListCreateView(APIView):
     permission_classes = [IsSuperuser]
 
     def get(self, request):
-        """List the caller's batches; ?status= filters by comma-separated status values."""
-        qs = BulkRerunBatch.objects.filter(created_by=request.user)
+        """List all users' batches; ?status= filters by comma-separated status values."""
+        qs = BulkRerunBatch.objects.all()
         status_param = request.query_params.get('status')
         if status_param:
             qs = qs.filter(status__in=[s.strip() for s in status_param.split(',')])
@@ -455,8 +489,9 @@ class BulkRerunBatchDetailView(APIView):
     Return the full status of a batch including per-course job state.
 
     GET /api/bulk-rerun/batches/<uuid:batch_id>/ — polled by the UI Track
-    Progress screen.  Returns 404 if the batch does not exist or was not
-    created by the requesting user.
+    Progress screen.  Visible to any authenticated user (the tracking page is
+    a shared view of every operator's batches); returns 404 only if the batch
+    does not exist.
 
     Supports ``?include_logs=false`` to omit each job's nested log lines,
     keeping the polling payload constant-size for long-running batches.  The
@@ -468,7 +503,7 @@ class BulkRerunBatchDetailView(APIView):
     permission_classes = [IsSuperuser]
 
     def get(self, request, batch_id):
-        """Return batch status and the nested job list; 404 if not owned by the caller."""
+        """Return batch status and the nested job list; 404 if the batch does not exist."""
         include_logs = request.query_params.get('include_logs', 'true').lower() != 'false'
 
         # Jobs MUST come back in position order so the UI can match them to
@@ -489,9 +524,6 @@ class BulkRerunBatchDetailView(APIView):
         except BulkRerunBatch.DoesNotExist:
             return Response(status=status.HTTP_404_NOT_FOUND)
 
-        if batch.created_by != request.user:
-            return Response(status=status.HTTP_404_NOT_FOUND)
-
         serializer_class = BulkRerunBatchSerializer if include_logs else BulkRerunBatchStatusSerializer
         return Response(serializer_class(batch).data)
 
@@ -502,20 +534,25 @@ class BulkRerunBatchCancelView(APIView):
 
     POST /api/bulk-rerun/batches/<uuid:batch_id>/cancel/ — marks all
     pending/running jobs as failed and sets the batch status to failed.
+    Any authenticated user may cancel any batch — the tracking page is a
+    shared view, so a cancel button rendered on another operator's batch
+    must work rather than 404.
+    Accepts an optional ``{"rollback": true}`` body — when set, a rollback
+    pass is dispatched after cancellation that deletes every course the
+    batch created so far (jobs with course_created=True).  Jobs still
+    mid-clone when cancel lands are covered by the _finalize_job race
+    guard, which deletes their course the moment they finish.
     Returns 400 if the batch is already in a terminal state.
-    Returns 404 if the batch does not exist or was not created by the caller.
+    Returns 404 if the batch does not exist.
     """
 
     permission_classes = [IsSuperuser]
 
     def post(self, request, batch_id):
-        """Cancel a non-terminal batch by marking all active jobs and the batch as failed."""
+        """Cancel a non-terminal batch; optionally roll back the courses it created."""
         try:
             batch = BulkRerunBatch.objects.get(id=batch_id)
         except BulkRerunBatch.DoesNotExist:
-            return Response(status=status.HTTP_404_NOT_FOUND)
-
-        if batch.created_by != request.user:
             return Response(status=status.HTTP_404_NOT_FOUND)
 
         terminal = {
@@ -529,6 +566,8 @@ class BulkRerunBatchCancelView(APIView):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
+        rollback = bool(request.data.get('rollback')) and not batch.is_dry_run
+
         from django.utils import timezone as tz  # pylint: disable=import-outside-toplevel
         now = tz.now()
         cancelled = batch.jobs.filter(
@@ -540,9 +579,88 @@ class BulkRerunBatchCancelView(APIView):
         )
         batch.status = BulkRerunBatch.Status.FAILED
         batch.completed_at = now
-        batch.save(update_fields=['status', 'completed_at'])
+        update_fields = ['status', 'completed_at']
 
-        return Response({'cancelled_jobs': cancelled, 'status': batch.status})
+        if rollback:
+            # PENDING must be set BEFORE the response so the _finalize_job race
+            # guard sees rollback_requested even if a mid-clone job finishes
+            # between this request returning and the rollback task starting.
+            batch.rollback_status = BulkRerunBatch.RollbackStatus.PENDING
+            update_fields.append('rollback_status')
+        batch.save(update_fields=update_fields)
+
+        if rollback:
+            _dispatch_rollback_in_background(str(batch.id))
+
+        return Response({
+            'cancelled_jobs': cancelled,
+            'status': batch.status,
+            'rollback_status': batch.rollback_status,
+        })
+
+
+class BulkRerunBatchRollbackView(APIView):
+    """
+    Roll back a terminal batch by deleting every course it created.
+
+    POST /api/bulk-rerun/batches/<uuid:batch_id>/rollback/ — dispatches the
+    rollback task and returns 202; the UI polls rollback_status on the batch.
+    Used from the History tab when a mistake is noticed after the run
+    finished (the Stop button covers the mid-run case via cancel's
+    ``rollback`` flag).
+
+    Only courses with course_created=True are deleted — targets the batch
+    adopted rather than created are never touched.  Deletion is permanent.
+
+    Returns 400 when the batch is not terminal, is a dry run, has already
+    had a rollback requested, or created no courses.
+    Returns 404 if the batch does not exist.
+    """
+
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request, batch_id):
+        """Validate eligibility and dispatch the rollback task; 202 on success."""
+        try:
+            batch = BulkRerunBatch.objects.get(id=batch_id)
+        except BulkRerunBatch.DoesNotExist:
+            return Response(status=status.HTTP_404_NOT_FOUND)
+
+        if not batch.is_terminal:
+            return Response(
+                {'error': 'Batch is still running — use cancel with rollback instead.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        if batch.is_dry_run:
+            return Response(
+                {'error': 'Dry-run batches create no courses; there is nothing to roll back.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        if batch.rollback_requested:
+            return Response(
+                {'error': f'A rollback was already requested (status: {batch.rollback_status}).'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        eligible = batch.jobs.filter(course_created=True, rolled_back=False).count()
+        if eligible == 0:
+            return Response(
+                {'error': 'This batch has no rollback-eligible courses on record. '
+                          'Batches run before rollback support cannot be rolled back automatically.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        batch.rollback_status = BulkRerunBatch.RollbackStatus.PENDING
+        batch.save(update_fields=['rollback_status'])
+        _dispatch_rollback_in_background(str(batch.id))
+
+        return Response(
+            {
+                'batch_id': str(batch.id),
+                'rollback_status': batch.rollback_status,
+                'eligible_courses': eligible,
+            },
+            status=status.HTTP_202_ACCEPTED,
+        )
 
 
 class CourseRerunJobLogsView(APIView):
@@ -552,7 +670,9 @@ class CourseRerunJobLogsView(APIView):
     GET /api/bulk-rerun/jobs/<uuid:job_id>/logs/ — returns all log lines.
     Supports ``?since=<id>`` for incremental polling; only lines with
     id > since are returned, avoiding re-fetching the full history.
-    Returns 404 if the job does not exist or was not created by the caller.
+    Visible to any authenticated user so the shared tracking page can stream
+    logs for batches started by other operators.
+    Returns 404 if the job does not exist.
     """
 
     permission_classes = [IsSuperuser]
@@ -562,9 +682,6 @@ class CourseRerunJobLogsView(APIView):
         try:
             job = CourseRerunJob.objects.get(id=job_id)
         except CourseRerunJob.DoesNotExist:
-            return Response(status=status.HTTP_404_NOT_FOUND)
-
-        if job.created_by != request.user:
             return Response(status=status.HTTP_404_NOT_FOUND)
 
         logs = job.logs.all()

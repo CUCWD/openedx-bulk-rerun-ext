@@ -165,6 +165,7 @@ class CourseRerunJobBriefSerializer(serializers.ModelSerializer):
             'source_course_key', 'target_course_key',
             'started_at', 'completed_at', 'elapsed_seconds',
             'error_message',
+            'course_created', 'rolled_back',
             'logs',
         ]
 
@@ -195,6 +196,7 @@ class BulkRerunBatchSerializer(serializers.ModelSerializer):
             'total_jobs', 'done_jobs', 'failed_jobs', 'settings_applied_count',
             'phase',
             'created_at', 'completed_at',
+            'rollback_status', 'rolled_back_at',
             'jobs',
         ]
 
@@ -255,6 +257,9 @@ class BulkRerunBatchSummarySerializer(serializers.ModelSerializer):
     """
 
     created_by_username = serializers.CharField(source='created_by.username', read_only=True)
+    # Number of courses this batch actually created (course_created=True jobs).
+    # The History UI uses this to decide whether a Rollback button is shown.
+    created_courses = serializers.IntegerField(read_only=True)
 
     class Meta:
         """Expose summary fields for the batch list endpoint; excludes nested jobs and logs."""
@@ -264,4 +269,5 @@ class BulkRerunBatchSummarySerializer(serializers.ModelSerializer):
             'id', 'status', 'mode', 'is_dry_run', 'target_run', 'prog_id',
             'created_at', 'completed_at', 'created_by_username',
             'config_json',
+            'rollback_status', 'rolled_back_at', 'created_courses',
         ]

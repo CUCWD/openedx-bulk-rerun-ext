@@ -17,8 +17,11 @@ from django.utils import timezone
 from openedx_bulk_rerun_ext.models import BulkRerunBatch, CourseRerunJob, CourseRerunLog, CourseRerunSettings
 from openedx_bulk_rerun_ext.tasks import (
     _check_batch_completion,
+    _finalize_job,
+    _rollback_job_course,
     apply_course_settings,
     dispatch_batch_rerun,
+    dispatch_batch_rollback,
     run_course_rerun,
 )
 
@@ -43,8 +46,14 @@ def course_rerun_state_mock():
     return MagicMock()
 
 
+@pytest.fixture
+def delete_course_mock():
+    """Platform contentstore delete_course used by the rollback path."""
+    return MagicMock()
+
+
 @pytest.fixture(autouse=True)
-def mock_platform_imports(rerun_course_mock, course_rerun_state_mock):
+def mock_platform_imports(rerun_course_mock, course_rerun_state_mock, delete_course_mock):
     """
     Pre-populate sys.modules with lightweight mocks for edx-platform packages.
     Cleaned up automatically after each test by patch.dict.
@@ -54,6 +63,7 @@ def mock_platform_imports(rerun_course_mock, course_rerun_state_mock):
         'cms.djangoapps': MagicMock(),
         'cms.djangoapps.contentstore': MagicMock(),
         'cms.djangoapps.contentstore.tasks': MagicMock(rerun_course=rerun_course_mock),
+        'cms.djangoapps.contentstore.utils': MagicMock(delete_course=delete_course_mock),
         'common': MagicMock(),
         'common.djangoapps': MagicMock(),
         'common.djangoapps.course_action_state': MagicMock(),
@@ -674,3 +684,216 @@ class TestApplyCourseSettingsFailure:
         ):
             apply_course_settings.apply(args=[str(batch_job.id)])
         assert batch_job.logs.filter(level=CourseRerunLog.Level.ERR).exists()
+
+
+# ── Rollback: _rollback_job_course / dispatch_batch_rollback / race guard ────
+
+def _xmodule_with_store(has_course=True):
+    """sys.modules dict faking xmodule with a store whose has_course returns the given value."""
+    mock_store = MagicMock()
+    mock_store.has_course.return_value = has_course
+    return {
+        'xmodule': MagicMock(), 'xmodule.modulestore': MagicMock(),
+        'xmodule.modulestore.django': MagicMock(modulestore=MagicMock(return_value=mock_store)),
+    }, mock_store
+
+
+@pytest.fixture
+def created_job(user, batch):
+    """A succeeded job whose course this batch actually created."""
+    return CourseRerunJob.objects.create(
+        source_course_key=SOURCE_KEY,
+        target_course_key=TARGET_KEY,
+        created_by=user,
+        batch=batch,
+        position=0,
+        status=CourseRerunJob.Status.SUCCEEDED,
+        course_created=True,
+    )
+
+
+class TestRollbackJobCourse:
+    """_rollback_job_course deletes only what the batch created and cleans up platform rows."""
+
+    def test_deletes_existing_course_and_marks_rolled_back(self, created_job, delete_course_mock):
+        fake_xmodule, _ = _xmodule_with_store(has_course=True)
+        with patch.dict(sys.modules, fake_xmodule):
+            assert _rollback_job_course(created_job) is True
+        delete_course_mock.assert_called_once()
+        created_job.refresh_from_db()
+        assert created_job.rolled_back is True
+        assert created_job.logs.filter(level='ok', message__icontains='Rollback complete').exists()
+
+    def test_missing_course_marks_rolled_back_without_delete(self, created_job, delete_course_mock):
+        fake_xmodule, _ = _xmodule_with_store(has_course=False)
+        with patch.dict(sys.modules, fake_xmodule):
+            assert _rollback_job_course(created_job) is True
+        delete_course_mock.assert_not_called()
+        created_job.refresh_from_db()
+        assert created_job.rolled_back is True
+
+    def test_platform_delete_failure_returns_false_and_keeps_flag(self, created_job, delete_course_mock):
+        delete_course_mock.side_effect = RuntimeError('mongo down')
+        fake_xmodule, _ = _xmodule_with_store(has_course=True)
+        with patch.dict(sys.modules, fake_xmodule):
+            assert _rollback_job_course(created_job) is False
+        created_job.refresh_from_db()
+        assert created_job.rolled_back is False
+        assert created_job.logs.filter(level='err', message__icontains='Rollback failed').exists()
+
+    def test_cleans_org_course_and_rerun_state_rows(self, created_job, course_rerun_state_mock):
+        fake_xmodule, _ = _xmodule_with_store(has_course=True)
+        with patch.dict(sys.modules, fake_xmodule):
+            _rollback_job_course(created_job)
+        org_course = sys.modules['organizations.models'].OrganizationCourse
+        org_course.objects.filter.assert_called_with(course_id=TARGET_KEY)
+        course_rerun_state_mock.objects.filter.assert_called_with(course_key=TARGET_KEY)
+
+
+class TestDispatchBatchRollback:
+    """dispatch_batch_rollback processes only course_created jobs and aggregates status."""
+
+    @pytest.fixture(autouse=True)
+    def _no_pace(self):
+        """Skip the inter-course pause so the dispatch tests stay fast."""
+        with patch('openedx_bulk_rerun_ext.tasks.time.sleep') as sleep_mock:
+            yield sleep_mock
+
+    def _add_job(self, batch, user, target, *, created, position):
+        return CourseRerunJob.objects.create(
+            source_course_key=SOURCE_KEY,
+            target_course_key=target,
+            created_by=user,
+            batch=batch,
+            position=position,
+            status=CourseRerunJob.Status.SUCCEEDED if created else CourseRerunJob.Status.FAILED,
+            course_created=created,
+        )
+
+    def test_nonexistent_batch_does_not_raise(self):
+        dispatch_batch_rollback.apply(args=['00000000-0000-0000-0000-000000000000'])
+
+    def test_pace_pauses_between_courses(self, batch, user, _no_pace):
+        """One pause is taken between courses, and none after the final course."""
+        self._add_job(batch, user, TARGET_KEY, created=True, position=0)
+        self._add_job(batch, user, 'course-v1:CA+X+2026', created=True, position=1)
+        with patch('openedx_bulk_rerun_ext.tasks._rollback_job_course', return_value=True):
+            dispatch_batch_rollback.apply(args=[str(batch.id)])
+        assert _no_pace.call_count == 1  # two courses → a single inter-course pause
+
+    def test_pace_setting_zero_skips_pause(self, batch, user, _no_pace):
+        """BULK_RERUN_ROLLBACK_PACE_SECONDS=0 disables the inter-course pause."""
+        from django.test import override_settings  # pylint: disable=import-outside-toplevel
+        self._add_job(batch, user, TARGET_KEY, created=True, position=0)
+        self._add_job(batch, user, 'course-v1:CA+X+2026', created=True, position=1)
+        with override_settings(BULK_RERUN_ROLLBACK_PACE_SECONDS=0), \
+             patch('openedx_bulk_rerun_ext.tasks._rollback_job_course', return_value=True):
+            dispatch_batch_rollback.apply(args=[str(batch.id)])
+        _no_pace.assert_not_called()
+
+    def test_only_created_jobs_rolled_back(self, batch, user):
+        created = self._add_job(batch, user, TARGET_KEY, created=True, position=0)
+        adopted = self._add_job(batch, user, 'course-v1:CA+X+2026', created=False, position=1)
+        with patch('openedx_bulk_rerun_ext.tasks._rollback_job_course', return_value=True) as rb:
+            dispatch_batch_rollback.apply(args=[str(batch.id)])
+        assert [c.args[0].id for c in rb.call_args_list] == [created.id]
+        assert adopted.id not in [c.args[0].id for c in rb.call_args_list]
+
+    def test_all_success_sets_rollback_succeeded(self, batch, user):
+        self._add_job(batch, user, TARGET_KEY, created=True, position=0)
+        with patch('openedx_bulk_rerun_ext.tasks._rollback_job_course', return_value=True):
+            dispatch_batch_rollback.apply(args=[str(batch.id)])
+        batch.refresh_from_db()
+        assert batch.rollback_status == BulkRerunBatch.RollbackStatus.SUCCEEDED
+        assert batch.rolled_back_at is not None
+
+    def test_mixed_results_set_rollback_partial(self, batch, user):
+        self._add_job(batch, user, TARGET_KEY, created=True, position=0)
+        self._add_job(batch, user, 'course-v1:CA+X+2026', created=True, position=1)
+        with patch('openedx_bulk_rerun_ext.tasks._rollback_job_course', side_effect=[True, False]):
+            dispatch_batch_rollback.apply(args=[str(batch.id)])
+        batch.refresh_from_db()
+        assert batch.rollback_status == BulkRerunBatch.RollbackStatus.PARTIAL
+
+    def test_all_failures_set_rollback_failed(self, batch, user):
+        self._add_job(batch, user, TARGET_KEY, created=True, position=0)
+        with patch('openedx_bulk_rerun_ext.tasks._rollback_job_course', return_value=False):
+            dispatch_batch_rollback.apply(args=[str(batch.id)])
+        batch.refresh_from_db()
+        assert batch.rollback_status == BulkRerunBatch.RollbackStatus.FAILED
+
+    def test_no_eligible_jobs_still_succeeds(self, batch, user):
+        self._add_job(batch, user, TARGET_KEY, created=False, position=0)
+        dispatch_batch_rollback.apply(args=[str(batch.id)])
+        batch.refresh_from_db()
+        assert batch.rollback_status == BulkRerunBatch.RollbackStatus.SUCCEEDED
+
+    def test_batch_run_status_untouched(self, batch, user):
+        batch.status = BulkRerunBatch.Status.PARTIAL
+        batch.save()
+        self._add_job(batch, user, TARGET_KEY, created=True, position=0)
+        with patch('openedx_bulk_rerun_ext.tasks._rollback_job_course', return_value=True):
+            dispatch_batch_rollback.apply(args=[str(batch.id)])
+        batch.refresh_from_db()
+        assert batch.status == BulkRerunBatch.Status.PARTIAL
+
+
+class TestFinalizeJobRollbackRaceGuard:
+    """A job finishing after a rollback was requested deletes its own course."""
+
+    def test_late_finisher_rolls_back_own_course(self, batch, user, created_job):
+        batch.rollback_status = BulkRerunBatch.RollbackStatus.RUNNING
+        batch.save()
+        with patch('openedx_bulk_rerun_ext.tasks._rollback_job_course', return_value=True) as rb:
+            _finalize_job(created_job, success=True)
+        rb.assert_called_once()
+        assert created_job.logs.filter(level='warn', message__icontains='after a rollback').exists()
+
+    def test_no_rollback_requested_leaves_course_alone(self, batch, user, created_job):
+        with patch('openedx_bulk_rerun_ext.tasks._rollback_job_course') as rb:
+            _finalize_job(created_job, success=True)
+        rb.assert_not_called()
+
+    def test_job_without_created_course_not_rolled_back(self, batch, user, batch_job):
+        batch.rollback_status = BulkRerunBatch.RollbackStatus.RUNNING
+        batch.save()
+        with patch('openedx_bulk_rerun_ext.tasks._rollback_job_course') as rb:
+            _finalize_job(batch_job, success=False, error='cancelled')
+        rb.assert_not_called()
+
+
+class TestCourseCreatedStamp:
+    """run_course_rerun stamps course_created only when the platform reports success."""
+
+    def test_successful_clone_stamps_course_created(self, job, rerun_course_mock):
+        with patch('openedx_bulk_rerun_ext.tasks.apply_course_settings.apply'):
+            run_course_rerun.apply(args=[str(job.id)])
+        job.refresh_from_db()
+        assert job.course_created is True
+
+    def test_adopted_existing_course_not_stamped(self, job, rerun_course_mock):
+        rerun_course_mock.apply.return_value = MagicMock(result='duplicate course')
+        fake_xmodule, _ = _xmodule_with_store(has_course=True)
+        with patch.dict(sys.modules, fake_xmodule), \
+             patch('openedx_bulk_rerun_ext.tasks.apply_course_settings.apply'):
+            run_course_rerun.apply(args=[str(job.id)])
+        job.refresh_from_db()
+        assert job.course_created is False
+
+    def test_dry_run_not_stamped(self, user, rerun_course_mock):
+        dry_batch = BulkRerunBatch.objects.create(
+            created_by=user,
+            mode=BulkRerunBatch.Mode.INDIVIDUAL,
+            target_run='2026_2027',
+            is_dry_run=True,
+        )
+        dry_job = CourseRerunJob.objects.create(
+            source_course_key=SOURCE_KEY,
+            target_course_key=TARGET_KEY,
+            created_by=user,
+            batch=dry_batch,
+        )
+        with patch('openedx_bulk_rerun_ext.tasks.apply_course_settings.apply'):
+            run_course_rerun.apply(args=[str(dry_job.id)])
+        dry_job.refresh_from_db()
+        assert dry_job.course_created is False
