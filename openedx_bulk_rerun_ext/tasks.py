@@ -17,9 +17,17 @@ def _dispatch_task(task, *args, **kwargs):
     dispatch to a running CMS Celery worker instead.
     """
     if getattr(django_settings, 'BULK_RERUN_USE_CELERY', False):
-        task.apply_async(args=list(args), **kwargs)
+        # Do not rely solely on a deployment-specific Celery route here.  The
+        # dedicated bulk-rerun worker consumes only this queue; without the
+        # explicit destination Celery sends these expensive tasks to the
+        # regular CMS queue and leaves that worker idle.
+        kwargs.setdefault(
+            'queue',
+            getattr(django_settings, 'BULK_RERUN_CELERY_QUEUE', 'edx.cms.core.bulk_rerun'),
+        )
+        return task.apply_async(args=list(args), **kwargs)
     else:
-        task.apply(args=list(args))
+        return task.apply(args=list(args))
 
 
 def _log(job_id, level, message):
