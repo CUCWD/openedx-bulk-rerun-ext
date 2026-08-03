@@ -438,21 +438,30 @@ def enroll_provisioner(job, course_key, requesting_user, settings):
 
 def remove_provisioner(job, course_key, requesting_user):
     """
-    Remove the provisioner account from the course admin and staff roles.
+    Remove the provisioner from course roles and enrollment.
 
     Called last, after all other settings have been applied, so the provisioner
     is not accidentally locked out before the course is fully configured.
     There is no public remove_instructor function in Teak; role removal is done
     via auth.remove_users with CourseInstructorRole and CourseStaffRole directly.
     """
-    _log(job.id, 'info', 'Removing provisioner from course admin access...')
+    _log(
+        job.id, 'info',
+        f'Removing provisioner {requesting_user.username} from course admin access...',
+    )
     try:
         # pylint: disable=import-outside-toplevel
         from common.djangoapps.student import auth
+        from common.djangoapps.student.models import CourseEnrollment
         from common.djangoapps.student.roles import CourseInstructorRole, CourseStaffRole
 
         auth.remove_users(requesting_user, CourseInstructorRole(course_key), requesting_user)
         auth.remove_users(requesting_user, CourseStaffRole(course_key), requesting_user)
+        _log(
+            job.id, 'info',
+            f'Unenrolling provisioner {requesting_user.username} from {course_key}...',
+        )
+        CourseEnrollment.unenroll(requesting_user, course_key)
         _log(job.id, 'ok', '✓ Provisioner removed.')
     except ImportError:
         _log(job.id, 'warn', 'Provisioner removal skipped: platform not available.')
