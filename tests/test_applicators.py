@@ -701,7 +701,7 @@ class TestEnrollProvisioner:
 
 
 class TestRemoveProvisioner:
-    """remove_provisioner strips course admin and staff roles from the requesting user."""
+    """remove_provisioner strips roles and enrollment from the requesting user."""
 
     def test_remove_users_called_twice(self, job, user, mock_platform_imports):
         remove_provisioner(job, COURSE_KEY, user)
@@ -716,6 +716,22 @@ class TestRemoveProvisioner:
         remove_provisioner(job, COURSE_KEY, user)
         for call in mock_platform_imports.auth.remove_users.call_args_list:
             assert call[0][2] == user
+
+    def test_unenroll_called_with_requesting_user_and_course(self, job, user, mock_platform_imports):
+        remove_provisioner(job, COURSE_KEY, user)
+        mock_platform_imports.CourseEnrollment.unenroll.assert_called_once_with(user, COURSE_KEY)
+
+    def test_unenroll_log_written(self, job, user):
+        remove_provisioner(job, COURSE_KEY, user)
+        assert job.logs.filter(
+            level='info', message__icontains=f'Unenrolling provisioner {user.username}',
+        ).exists()
+
+    def test_admin_access_removal_log_includes_username(self, job, user):
+        remove_provisioner(job, COURSE_KEY, user)
+        assert job.logs.filter(
+            level='info', message__icontains=f'Removing provisioner {user.username}',
+        ).exists()
 
     def test_success_ok_log_written(self, job, user):
         remove_provisioner(job, COURSE_KEY, user)
