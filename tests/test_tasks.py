@@ -14,12 +14,19 @@ from django.contrib.auth import get_user_model
 from django.db.utils import IntegrityError
 from django.utils import timezone
 
-from openedx_bulk_rerun_ext.models import BulkRerunBatch, CourseRerunJob, CourseRerunLog, CourseRerunSettings
+from openedx_bulk_rerun_ext.models import (
+    BulkRerunBatch,
+    CourseRerunJob,
+    CourseRerunLog,
+    CourseRerunSettings,
+    CourseRerunTeamMember,
+)
 from openedx_bulk_rerun_ext.tasks import (
     _check_batch_completion,
     _dispatch_task,
     _finalize_job,
     _rollback_job_course,
+    _rollback_remove_team_member_enrollments,
     apply_course_settings,
     dispatch_batch_rerun,
     dispatch_batch_rollback,
@@ -775,6 +782,84 @@ class TestRollbackJobCourse:
         org_course = sys.modules['organizations.models'].OrganizationCourse
         org_course.objects.filter.assert_called_with(course_id=TARGET_KEY)
         course_rerun_state_mock.objects.filter.assert_called_with(course_key=TARGET_KEY)
+
+    def test_unenrolls_batch_instructors_and_staff(self, created_job, user, delete_course_mock):
+        instructor = User.objects.create_user(username='instructor', email='instructor@example.com')
+        staff = User.objects.create_user(username='staff', email='staff@example.com')
+        User.objects.create_user(username='researcher', email='researcher@example.com')
+        CourseRerunTeamMember.objects.create(
+            batch=created_job.batch, org='AeroTech', email=instructor.email,
+            studio_role=CourseRerunTeamMember.StudioRole.ADMIN,
+        )
+        CourseRerunTeamMember.objects.create(
+            batch=created_job.batch, org='AeroTech', email=staff.email,
+            studio_role=CourseRerunTeamMember.StudioRole.STAFF,
+        )
+        CourseRerunTeamMember.objects.create(
+            batch=created_job.batch, org='AeroTech', email='researcher@example.com',
+            studio_role=CourseRerunTeamMember.StudioRole.DATA_RESEARCHER,
+        )
+        enrollment = MagicMock()
+        fake_xmodule, _ = _xmodule_with_store(has_course=True)
+        fake_student = {
+            'common.djangoapps.student': MagicMock(),
+            'common.djangoapps.student.models': MagicMock(CourseEnrollment=enrollment),
+        }
+        with patch.dict(sys.modules, {**fake_xmodule, **fake_student}):
+            assert _rollback_job_course(created_job) is True
+
+        assert enrollment.unenroll.call_count == 2
+        assert {call.args[0].email for call in enrollment.unenroll.call_args_list} == {
+            instructor.email, staff.email,
+        }
+        assert enrollment.objects.filter.call_count == 2
+        assert all(
+            call.kwargs['course_id'] == TARGET_KEY
+            for call in enrollment.objects.filter.call_args_list
+        )
+        assert enrollment.objects.filter.return_value.delete.call_count == 2
+
+    def test_failed_unenrollment_keeps_job_retryable(self, created_job):
+        member = User.objects.create_user(username='staff', email='staff@example.com')
+        CourseRerunTeamMember.objects.create(
+            batch=created_job.batch, org='AeroTech', email=member.email,
+            studio_role=CourseRerunTeamMember.StudioRole.STAFF,
+        )
+        enrollment = MagicMock()
+        enrollment.unenroll.side_effect = RuntimeError('enrollment service down')
+        fake_xmodule, _ = _xmodule_with_store(has_course=True)
+        fake_student = {
+            'common.djangoapps.student': MagicMock(),
+            'common.djangoapps.student.models': MagicMock(CourseEnrollment=enrollment),
+        }
+        with patch.dict(sys.modules, {**fake_xmodule, **fake_student}):
+            assert _rollback_job_course(created_job) is False
+
+        created_job.refresh_from_db()
+        assert created_job.rolled_back is False
+
+    def test_standalone_job_has_no_team_member_cleanup(self, job):
+        assert _rollback_remove_team_member_enrollments(
+            job, MagicMock(org='AeroTech'),
+        ) is True
+
+    def test_missing_team_member_user_is_already_clean(self, created_job):
+        CourseRerunTeamMember.objects.create(
+            batch=created_job.batch,
+            org='AeroTech',
+            email='missing@example.com',
+            studio_role=CourseRerunTeamMember.StudioRole.STAFF,
+        )
+        enrollment = MagicMock()
+        fake_student = {
+            'common.djangoapps.student': MagicMock(),
+            'common.djangoapps.student.models': MagicMock(CourseEnrollment=enrollment),
+        }
+        with patch.dict(sys.modules, fake_student):
+            assert _rollback_remove_team_member_enrollments(
+                created_job, MagicMock(org='AeroTech'),
+            ) is True
+        enrollment.unenroll.assert_not_called()
 
 
 class TestDispatchBatchRollback:

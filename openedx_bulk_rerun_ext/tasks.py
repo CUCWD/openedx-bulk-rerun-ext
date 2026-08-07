@@ -8,6 +8,18 @@ from django.conf import settings as django_settings
 from django.utils import timezone
 
 
+# -------------------------------------
+# Logging
+# -------------------------------------
+def _log(job_id, level, message):
+    """Append a structured log line to CourseRerunLog for the given job."""
+    from .models import CourseRerunLog  # pylint: disable=import-outside-toplevel
+    CourseRerunLog.objects.create(job_id=job_id, level=level, message=message)
+
+
+# -------------------------------------
+# Task helpers
+# -------------------------------------
 def _dispatch_task(task, *args, **kwargs):
     """
     Dispatch a Celery task to the broker or run it synchronously in the current thread.
@@ -30,12 +42,6 @@ def _dispatch_task(task, *args, **kwargs):
         return task.apply(args=list(args))
 
 
-def _log(job_id, level, message):
-    """Append a structured log line to CourseRerunLog for the given job."""
-    from .models import CourseRerunLog  # pylint: disable=import-outside-toplevel
-    CourseRerunLog.objects.create(job_id=job_id, level=level, message=message)
-
-
 def _check_batch_completion(batch_id):
     """Roll up batch status once all child jobs have reached a terminal state."""
     from .models import BulkRerunBatch, CourseRerunJob  # pylint: disable=import-outside-toplevel
@@ -56,72 +62,6 @@ def _check_batch_completion(batch_id):
         batch.status = BulkRerunBatch.Status.PARTIAL
     batch.completed_at = timezone.now()
     batch.save(update_fields=['status', 'completed_at'])
-
-
-def _rollback_job_course(job):
-    """
-    Delete the course a job created, plus the platform rows that reference it.
-
-    Returns True on success (or when the course is already gone), False when
-    the platform delete raised.  Only ever called for jobs with
-    ``course_created=True`` — courses a batch merely adopted are untouchable.
-    Deletion uses the platform's delete_course so content, team roles, and
-    enrollments are removed together; falls back to the raw modulestore
-    delete when the contentstore helper is unavailable.
-    """
-    from opaque_keys.edx.keys import CourseKey  # pylint: disable=import-outside-toplevel
-
-    target_key = CourseKey.from_string(job.target_course_key)
-
-    # If the course is already gone (deleted manually, or a previous rollback
-    # attempt got interrupted after the delete), just mark the job rolled back.
-    course_exists = True
-    try:
-        # pylint: disable-next=import-outside-toplevel,import-error
-        from xmodule.modulestore.django import modulestore as get_store
-        course_exists = get_store().has_course(target_key)
-    except Exception:  # pragma: no cover  # pylint: disable=broad-exception-caught
-        pass
-
-    if course_exists:
-        _log(job.id, 'info', f'Rollback: deleting created course {job.target_course_key}...')
-        try:
-            try:
-                # import-error is intentionally not suppressed: the try/except
-                # ImportError below already tells pylint this import may fail.
-                # pylint: disable-next=import-outside-toplevel
-                from cms.djangoapps.contentstore.utils import delete_course
-                delete_course(target_key, job.created_by_id)
-            except ImportError:  # pragma: no cover
-                # pylint: disable-next=import-outside-toplevel
-                from xmodule.modulestore.django import modulestore as get_store
-                get_store().delete_course(target_key, job.created_by_id)
-        except Exception as exc:  # pylint: disable=broad-exception-caught
-            _log(job.id, 'err', f'Rollback failed for {job.target_course_key}: {exc}')
-            return False
-    else:
-        _log(job.id, 'info',
-             f'Rollback: course {job.target_course_key} no longer exists — nothing to delete.')
-
-    # Mirror of the stale-row cleanup done before creation: remove the
-    # org-course association and rerun-state rows so a future rerun of the
-    # same target key starts clean.
-    try:
-        from organizations.models import OrganizationCourse  # pylint: disable=import-outside-toplevel,import-error
-        OrganizationCourse.objects.filter(course_id=str(target_key)).delete()
-    except Exception:  # pragma: no cover  # pylint: disable=broad-exception-caught
-        pass
-    try:
-        # pylint: disable-next=import-outside-toplevel,import-error
-        from common.djangoapps.course_action_state.models import CourseRerunState
-        CourseRerunState.objects.filter(course_key=str(target_key)).delete()
-    except Exception:  # pragma: no cover  # pylint: disable=broad-exception-caught
-        pass
-
-    job.rolled_back = True
-    job.save(update_fields=['rolled_back'])
-    _log(job.id, 'ok', f'Rollback complete: {job.target_course_key} removed.')
-    return True
 
 
 def _finalize_job(job, success, error=''):
@@ -147,7 +87,7 @@ def _finalize_job(job, success, error=''):
             return
         if batch.rollback_requested and job.course_created and not job.rolled_back:
             _log(job.id, 'warn',
-                 'Job finished after a rollback was requested — removing its course.')
+                 'Rollback: job finished after a rollback was requested — removing its course.')
             _rollback_job_course(job)
 
 
@@ -427,17 +367,163 @@ def apply_course_settings(self, job_id):
             raise self.retry(exc=exc)
 
 
+# -------------------------------------
+# Rollback helpers
+# -------------------------------------
+def _rollback_remove_team_member_enrollments(job, course_key):
+    """
+    Unenroll and remove batch-assigned team members from a rolled-back course.
+
+    ``delete_course`` normally removes course data, but it is not a reliable
+    cleanup boundary for LMS enrollment rows.  Team members are recorded on
+    the batch, so use that snapshot rather than trying to infer ownership from
+    the course after it has been deleted.  Empty org entries are legacy CAR
+    entries that apply to every target organization.
+
+    Returns ``True`` when every applicable member was removed (or there were
+    no applicable members), and ``False`` when at least one unenrollment failed.
+    """
+    if not job.batch_id:
+        # Standalone reruns do not have a team-member snapshot to clean up.
+        return True
+
+    try:
+        # Keep platform imports inside the helper so the extension can still be
+        # imported in environments where the full Open edX platform is absent.
+        from common.djangoapps.student.models import CourseEnrollment  # pylint: disable=import-outside-toplevel
+        from django.contrib.auth import get_user_model  # pylint: disable=import-outside-toplevel
+
+        from .models import CourseRerunTeamMember  # pylint: disable=import-outside-toplevel
+    except ImportError:
+        _log(job.id, 'warn', 'Rollback: team member unenrollment skipped: platform not available.')
+        return True
+
+    # Team-member records with an empty organization are legacy CAR entries and
+    # apply to every target organization. Include them with this course's org.
+    target_org = getattr(course_key, 'org', '')
+    members = job.batch.team_members.filter(
+        org__in=('', target_org),
+        studio_role__in=[
+            CourseRerunTeamMember.StudioRole.ADMIN,
+            CourseRerunTeamMember.StudioRole.STAFF,
+        ],
+    )
+    User = get_user_model()  # noqa: N806
+    all_removed = True
+
+    for member in members:
+        try:
+            # Resolve the enrollment owner from the snapshot's email address.
+            user = User.objects.get(email=member.email)
+        except User.DoesNotExist:
+            _log(job.id, 'warn', f'Rollback: {member.email} not found — already unenrolled from {course_key}.')
+            continue
+
+        try:
+            # Use the platform API first so unenrollment signals, events,
+            # refunds, and cache invalidation happen normally. The API marks
+            # the enrollment inactive rather than deleting its database row.
+            CourseEnrollment.unenroll(user, course_key)
+            _log(job.id, 'ok', f'Rollback: unenrolled {member.email} from {course_key}.')
+
+            # This course was created by the batch and is being removed during
+            # rollback, so retain no stale enrollment row for this team member.
+            # This delete is intentionally scoped to the resolved user/course
+            # pair and happens only after the normal unenrollment succeeds.
+            CourseEnrollment.objects.filter(
+                user=user,
+                course_id=str(course_key),
+            ).delete()
+            _log(job.id, 'ok', f'Rollback: deleted enrollment for {member.email} from {course_key}.')
+        except Exception as exc:  # pylint: disable=broad-exception-caught
+            _log(job.id, 'err', f'Rollback: failed to remove enrollment for {member.email} from {course_key}: {exc}')
+            all_removed = False
+
+    return all_removed
+
+
+def _rollback_job_course(job):
+    """
+    Delete the course a job created, plus the platform rows that reference it.
+
+    Returns True on success (or when the course is already gone), False when
+    the platform delete raised.  Only ever called for jobs with
+    ``course_created=True`` — courses a batch merely adopted are untouchable.
+    Deletion uses the platform's delete_course so content, team roles, and
+    enrollments are removed together; falls back to the raw modulestore
+    delete when the contentstore helper is unavailable.
+    """
+    from opaque_keys.edx.keys import CourseKey  # pylint: disable=import-outside-toplevel
+
+    target_key = CourseKey.from_string(job.target_course_key)
+
+    # If the course is already gone (deleted manually, or a previous rollback
+    # attempt got interrupted after the delete), just mark the job rolled back.
+    course_exists = True
+    try:
+        # pylint: disable-next=import-outside-toplevel,import-error
+        from xmodule.modulestore.django import modulestore as get_store
+        course_exists = get_store().has_course(target_key)
+    except Exception:  # pragma: no cover  # pylint: disable=broad-exception-caught
+        pass
+
+    if course_exists:
+        _log(job.id, 'info', f'Rollback: deleting created course {job.target_course_key}...')
+        try:
+            try:
+                # import-error is intentionally not suppressed: the try/except
+                # ImportError below already tells pylint this import may fail.
+                # pylint: disable-next=import-outside-toplevel
+                from cms.djangoapps.contentstore.utils import delete_course
+                delete_course(target_key, job.created_by_id)
+            except ImportError:  # pragma: no cover
+                # pylint: disable-next=import-outside-toplevel
+                from xmodule.modulestore.django import modulestore as get_store
+                get_store().delete_course(target_key, job.created_by_id)
+        except Exception as exc:  # pylint: disable=broad-exception-caught
+            _log(job.id, 'err', f'Rollback failed for {job.target_course_key}: {exc}')
+            return False
+    else:
+        _log(job.id, 'info',
+             f'Rollback: course {job.target_course_key} no longer exists — nothing to delete.')
+
+    # Keep the rollback retryable if any batch instructor/staff enrollment
+    # could not be removed after the course deletion succeeded.
+    if not _rollback_remove_team_member_enrollments(job, target_key):
+        return False
+
+    # Mirror of the stale-row cleanup done before creation: remove the
+    # org-course association and rerun-state rows so a future rerun of the
+    # same target key starts clean.
+    try:
+        from organizations.models import OrganizationCourse  # pylint: disable=import-outside-toplevel,import-error
+        OrganizationCourse.objects.filter(course_id=str(target_key)).delete()
+    except Exception:  # pragma: no cover  # pylint: disable=broad-exception-caught
+        pass
+    try:
+        # pylint: disable-next=import-outside-toplevel,import-error
+        from common.djangoapps.course_action_state.models import CourseRerunState
+        CourseRerunState.objects.filter(course_key=str(target_key)).delete()
+    except Exception:  # pragma: no cover  # pylint: disable=broad-exception-caught
+        pass
+
+    job.rolled_back = True
+    job.save(update_fields=['rolled_back'])
+    _log(job.id, 'ok', f'Rollback complete: {job.target_course_key} removed.')
+    return True
+
+
 @shared_task
 def dispatch_batch_rollback(batch_id):
     """
     Delete every course this batch created (jobs with ``course_created=True``).
 
     Deletions run sequentially, one course per iteration, with a short pause
-    between them (``BULK_RERUN_ROLLBACK_PACE_SECONDS``, default 0.75).  The
+    between them (``BULK_RERUN_ROLLBACK_PACE_SECONDS``, default 0.75). The
     pacing is deliberate — like the stagger the creation fan-out uses — so each
     course's removal is observable in the UI: the per-course chip flips
     Deleting → Deleted and the progress bar advances one step at a time rather
-    than jumping from nothing to done.  Status is aggregated once at the end of
+    than jumping from nothing to done. Status is aggregated once at the end of
     the single task, so it stays race-free; jobs that never created a course are
     skipped; the run-lifecycle ``status`` field is never touched.
     """
