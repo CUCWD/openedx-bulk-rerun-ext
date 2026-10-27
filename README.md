@@ -596,3 +596,74 @@ If a course fails, the `err`-level log lines describe exactly what went wrong. A
 ### 9. Cancel a batch (if needed)
 
 If you need to stop a batch that is still running, click **Cancel**. This immediately marks all `pending` and `running` jobs as `failed` and sets the batch status to `failed`. Courses that already completed are not rolled back.
+
+## Backfill historical certificate display settings
+
+Run `backfill_certificate_display` in the deployed Studio Django environment with
+this plugin installed. It joins each rerun job to `batch.settings.cert_display`
+and reconciles the target course's `certificates_display_behavior` in the
+modulestore. The SQL settings rows are the source of truth and are not modified.
+This repair applies regardless of the batch's `create_cert` flag.
+
+Preview first, then apply with an existing Django username for edit attribution:
+
+```bash
+set -o pipefail
+python manage.py cms backfill_certificate_display 2>&1 | tee certificate-display-preview.log
+python manage.py cms backfill_certificate_display --apply --username operator 2>&1 | tee certificate-display-apply.log
+```
+
+Replace `operator` with the operator's Django username. Use your deployment's normal wrapper
+for running Studio management commands if needed. Run while rerun/settings jobs
+and manual edits to these courses are idle; this command does not lock them.
+
+Optionally add `--org AeroTech` to either command to restrict processing to that
+exact, case-sensitive organization in the **target** course key:
+
+```bash
+python manage.py cms backfill_certificate_display --org AeroTech
+python manage.py cms backfill_certificate_display --org AeroTech --apply --username operator
+```
+
+Omitting `--org` processes all organizations. The start and summary audit lines
+include the selected organization; the summary counts excluded courses as
+`filtered_courses`. Invalid target keys are reported as errors because their
+organization cannot be determined.
+
+Courses are processed alphabetically by target course key (case-insensitive).
+Completed jobs, including failed jobs with existing target courses, are inspected.
+Dry-run batches, unfinished jobs, rollback batches/jobs, and missing batch/settings
+links are logged as skipped. Multiple eligible jobs for one course are combined;
+conflicting or invalid settings are reported without writing that course.
+Missing courses and save/verification failures are errors. Processing continues
+and the command exits nonzero if any course has an error.
+
+Each JSON audit line includes the course, source job/batch/settings IDs, and the
+stored `cert_display`. Changed courses have `before`, `expected`, and `saved`
+values; `updated` is emitted only after saving and re-fetching the course.
+An `updating` line records intent before the write, so a later error may mean a
+write succeeded but verification failed. A summary reports outcome counts.
+The summary also includes a `changes` object grouped by status (`updated` or
+`would_update`). Each group lists courses alphabetically with each `course_id`,
+and the `before`/`after` values of
+`certificates_display_behavior`. Preview values are proposed; applied values are
+read back after saving. Unchanged courses and failed updates are excluded from
+these groups and remain documented in the individual audit events and counts.
+`before` uses Studio's `CourseDetails.validate_certificate_settings()` to show
+the effective behavior, including certificate availability date handling. The
+unmodified stored value remains in detailed audit events as `before_raw`.
+When no changes are reported, `changes` is an empty object (`{}`).
+Already matching courses are logged as `unchanged`, making repeat runs safe.
+The command updates only the course setting and does not publish draft content.
+
+Audit events also use the Python logger
+`openedx_bulk_rerun_ext.management.commands.backfill_certificate_display`:
+normal events use `INFO`, skipped jobs use `WARNING`, and errors use `ERROR`.
+Configure this logger at `INFO` in Django's logging settings to retain all events
+in your deployment's log handlers. The complete JSON audit is always written to
+stdout as well. If a log handler also writes to the console, a combined
+`2>&1` capture may contain both the audit and the formatted logger copy.
+
+Attach the log to a GitHub issue, or paste its audit lines into a fenced `json`
+code block. Include the environment, plugin version, and whether this was a preview
+or apply run. Keep the start and summary lines along with any errors.
