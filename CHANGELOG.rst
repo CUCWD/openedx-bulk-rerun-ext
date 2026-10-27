@@ -14,6 +14,29 @@ Change Log
 Unreleased
 **********
 
+0.2.5 – 2026-10-27
+******************
+
+Added
+=====
+
+* Add the ``backfill_certificate_display`` management command to reconcile
+  historical rerun courses with their batch certificate display settings.
+  Preview by default, filter targets with ``--org``, and save changes with
+  ``--apply --username`` using the resolved user for edit attribution.
+* Process courses alphabetically and emit JSON audit output through stdout and
+  Python logging, with summary changes grouped by status and per-course
+  before/after values. Report skipped jobs, conflicting settings, and failures.
+
+Fixed
+=====
+
+* Repair malformed certificate display strings using validated platform enum
+  values and verify the course setting after saving to the modulestore.
+* Report the effective ``before`` behavior using Studio's certificate settings
+  validation, including availability dates, while retaining the raw stored value
+  in detailed audit events.
+
 0.2.4 – 2026-10-27
 ******************
 
