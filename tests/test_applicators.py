@@ -313,6 +313,38 @@ class TestApplyCertificates:
         apply_certificates(job, COURSE_KEY, settings_obj)
         mock_platform_imports.mock_store.update_item.assert_called_once()
 
+    @pytest.mark.parametrize('cert_display', ['early_no_info', 'early_with_info', 'end'])
+    def test_cert_display_saved_to_course(self, job, settings_obj, mock_platform_imports, cert_display):
+        """The selected display behavior replaces the cloned value before saving."""
+        settings_obj.cert_display = cert_display
+        course = mock_platform_imports.mock_course
+        course.certificates_display_behavior = 'inherited_value'
+        saved_display_values = []
+        mock_platform_imports.mock_store.update_item.side_effect = (
+            lambda block, user_id: saved_display_values.append(block.certificates_display_behavior)
+        )
+
+        apply_certificates(job, COURSE_KEY, settings_obj)
+
+        assert saved_display_values == [cert_display]
+        mock_platform_imports.mock_store.update_item.assert_called_once_with(course, job.created_by.id)
+        assert job.logs.filter(
+            level='ok',
+            message=f'Certificate display behavior saved for {COURSE_KEY}: {cert_display}.',
+        ).exists()
+
+    @pytest.mark.parametrize('error_type', [RuntimeError, ImportError])
+    def test_cert_save_failure_propagates(self, job, settings_obj, mock_platform_imports, error_type):
+        """Save failures reach task retries without reporting success or enabling generation."""
+        mock_platform_imports.mock_store.update_item.side_effect = error_type('save failed')
+
+        with pytest.raises(error_type, match='save failed'):
+            apply_certificates(job, COURSE_KEY, settings_obj)
+
+        assert not job.logs.filter(level='ok', message__icontains='Certificate display behavior saved').exists()
+        assert not job.logs.filter(level='ok', message__icontains='Certificates applied').exists()
+        mock_platform_imports.set_cert_generation_enabled.assert_not_called()
+
     def test_existing_cert_is_activated_not_replaced(self, job, settings_obj, mock_platform_imports):
         existing = {'id': 99, 'name': 'Existing Cert', 'is_active': False}
         mock_platform_imports.mock_course.certificates = {'certificates': [existing]}

@@ -95,7 +95,8 @@ def apply_certificates(job, course_key, settings):
          course_modes in the Studio certificate UI is read at runtime from
          CourseMode.modes_for_course(), so this row is what ties settings.course_mode
          to the certificate context — there is no mode field in the XBlock cert schema.
-      2. Ensure a certificate configuration exists on the course XBlock.
+      2. Save the certificate display behavior and ensure a certificate
+         configuration exists on the course XBlock.
          clone_course copies the source's certificates field, so re-runs usually
          inherit a config already; we activate the first one.  If the source had
          none, we create a minimal default so certificate generation has something
@@ -132,8 +133,15 @@ def apply_certificates(job, course_key, settings):
             try:
                 # pylint: disable=import-outside-toplevel
                 from xmodule.modulestore.django import modulestore
+            except ImportError:
+                _log(job.id, 'warn', 'Certificate configuration skipped: platform not available.')
+            else:
                 store = modulestore()
                 course = store.get_course(course_key)
+                # cert_display is saved on the batch's CourseRerunSettings row,
+                # but the LMS reads certificates_display_behavior on the course.
+                # Override the cloned value with the operator's selection.
+                course.certificates_display_behavior = settings.cert_display
                 cert_list = course.certificates.get('certificates', [])
                 if cert_list:
                     cert_list[0]['is_active'] = True
@@ -147,10 +155,16 @@ def apply_certificates(job, course_key, settings):
                         'is_active': True,
                         'editing': False,
                     }]
+                # Persist both the display behavior and certificate configuration
+                # to the modulestore; assigning XBlock fields alone does not save them.
+                # Let save errors propagate to apply_course_settings for logging
+                # and retries. Only report success after update_item returns.
                 store.update_item(course, job.created_by.id)
+                _log(
+                    job.id, 'ok',
+                    f'Certificate display behavior saved for {course_key}: {settings.cert_display}.',
+                )
                 _log(job.id, 'ok', 'Certificate configuration activated.')
-            except ImportError:
-                _log(job.id, 'warn', 'Certificate configuration skipped: platform not available.')
 
             # Step 3: Enable self-generation so the LMS can issue certs to learners.
             try:
