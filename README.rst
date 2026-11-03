@@ -22,6 +22,31 @@ organization. It should make clear where this fits into the overall Open edX
 codebase and should be oriented towards people who are new to the Open edX
 project.
 
+Ulmo dependency compatibility
+*****************************
+
+Install into an environment already provisioned with Ulmo's
+``openedx-platform/requirements``. Runtime metadata declares unpinned direct
+requirements so the host platform controls shared package versions. To install
+without changing existing dependencies, run from this repository::
+
+    python -m pip install --no-deps .
+    python -m pip check
+
+Development and test requirements belong in isolated environments. Shared pins
+in ``requirements/ulmo-constraints.txt`` come from platform commit
+``46c543590c78aa1bfa846d47a4f1c5c6ec388490``; refresh them with the target platform.
+The lint-only pycodestyle pin retains Python 3.12 support and does not affect
+runtime dependencies.
+
+Run standalone tests with ``tox -e django42,django52``. The Ulmo environment uses
+Django 5.2.11, while Django 4.2 provides compatibility coverage. Platform services
+are mocked by the test suite; full integration checks require edx-platform.
+
+``requirements/base.txt`` and ``requirements/test.txt`` reference their input
+files. ``make compile-requirements`` and ``make upgrade`` preserve these files
+while regenerating tooling locks against the Ulmo constraints.
+
 Getting Started with Development
 ********************************
 

@@ -2,9 +2,13 @@
 
 -c constraints.txt
 
--r test.txt               # Core and testing dependencies for this package
+-r test.in               # Core and testing dependencies for this package
 
 edx-lint                  # edX pylint rules and plugins
 isort                     # to standardize order of imports
-pycodestyle               # PEP 8 compliance validation
+# Retain Python 3.12 f-string support; Ulmo's older checker misparses them.
+pycodestyle==2.14.0        # Isolated lint tooling, never a runtime dependency
 pydocstyle                # PEP 257 compliance validation
+
+# Match the Ulmo runtime for standalone checks.
+Django==5.2.11

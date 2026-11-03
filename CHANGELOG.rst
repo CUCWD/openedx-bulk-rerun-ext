@@ -14,6 +14,23 @@ Change Log
 Unreleased
 **********
 
+0.2.6 – 2026-11-03
+******************
+
+Changed
+========
+
+* Defer runtime dependency versions to the host Ulmo edx-platform installation.
+* Declare the directly imported edx-organizations dependency and move
+  openedx-atlas from runtime requirements to development tooling.
+* Replace runtime and test lockfiles with references to their input files,
+  preserving those references during requirement compilation and upgrades.
+* Replace remote common constraints with a local Ulmo snapshot and regenerate
+  development, quality, documentation, and installer dependency locks.
+* Use Django 5.2.11 for Ulmo tests and ancillary checks while retaining Django
+  4.2 compatibility coverage and Python 3.12-compatible style checks.
+* Run all CI matrix jobs and upload coverage from the Ulmo Django test job.
+
 0.2.5 – 2026-10-27
 ******************
 
