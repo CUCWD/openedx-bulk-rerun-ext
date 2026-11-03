@@ -1,10 +1,8 @@
-# Core requirements for using this application
--c constraints.txt
-
+# Runtime dependency versions are supplied by the host edx-platform environment.
+# Do not include development constraints or compiled locks in package metadata.
 Django
 celery
 djangorestframework
 edx-django-utils
 edx-opaque-keys
-
-openedx-atlas
+edx-organizations

@@ -7,3 +7,5 @@
 
 diff-cover                # Changeset diff test coverage
 edx-i18n-tools            # For i18n_tool dummy
+
+openedx-atlas             # Translation tooling, not a runtime dependency
